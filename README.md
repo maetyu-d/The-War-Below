@@ -1,6 +1,6 @@
-# The War Below (OpenGL)
+# The War Below
 
-A split-screen, two-player voxel trench warfare mining game built with Python + OpenGL (tested on macOS 13.7.8).
+A split-screen, two-player tunneling warfare game built with Python + OpenGL (tested on macOS 13.7.8).
 
 ## Features
 - 2-player split-screen with both players having the same abilities.
