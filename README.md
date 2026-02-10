@@ -1,6 +1,6 @@
-# The War Below (OpenGL)
+# The War Below
 
-A first-person voxel tunnel warfare game built with Python + OpenGL.
+A first-person voxel tunnel warfare game built with Python + OpenGL (tested on Mac OS 13.7.8).
 
 ## Controls
 - `W/A/S/D`: move
