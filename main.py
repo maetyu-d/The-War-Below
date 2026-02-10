@@ -22,7 +22,7 @@ WORLD_Y = 96
 WORLD_Z = 96
 CHUNK_SIZE = 16
 RENDER_DISTANCE = 70
-GRAVITY = 52.0
+GRAVITY = 26.0
 JUMP_SPEED = 10.0
 PLAYER_SPEED = 7.0
 MOUSE_SENS = 0.0027
@@ -33,7 +33,11 @@ PLAYER_BODY_UPPER = 0.40
 PLAYER_HEAD_RADIUS_SCALE = 0.92
 REACH = 2.0
 GRAVITY_BLEND_POWER = 6.0
+FOV_DEG = 75.0
 MINE_FUSE_SECONDS = 10.0
+MINE_RENDER_DISTANCE = 42.0
+MINE_SPHERE_STACKS = 4
+MINE_SPHERE_SLICES = 8
 MINE_TIME_DIRT = 0.28
 MINE_TIME_STONE = 0.55
 MINE_TIME_WOOD = 0.42
@@ -47,13 +51,31 @@ EXPLOSION_PARTICLE_SPEED = 13.0
 EXPLOSION_SPARK_COUNT = 120
 EXPLOSION_RING_POINTS = 64
 EXPLOSION_AXIS_SPREAD = 0.14
+GAMEPAD_DEADZONE = 0.22
+GAMEPAD_LOOK_SPEED = 3.0
+MOVE_INPUT_DEADZONE = 0.18
+COYOTE_TIME = 0.12
+JUMP_BUFFER_TIME = 0.12
+FALL_GRAVITY_MULT = 1.18
+JUMP_CUT_GRAVITY_MULT = 1.95
+PLAYER_MAX_HEALTH = 100.0
+HAZARD_CONTACT_DPS = 5.0
+HAZARD_TINT = (0.82, 0.92, 0.16)
+HAZARD_TEX_INDEX = 4
+UP_SMOOTH_RATE = 10.0
+XRAY_MINE_COUNT_PER_FACE = 3
+XRAY_TRIGGER_RANGE = 2.4
+XRAY_RAY_RANGE = 14
+XRAY_BEAM_DURATION = 0.55
+DEATH_BLACKOUT_SECONDS = 5.0
+DEATH_FADE_SECONDS = 2.0
 
 CUBE_HALF = 20
 FACE_RELIEF = 10
 
 TEX_SIZE = 16
 ATLAS_COLS = 2
-ATLAS_ROWS = 2
+ATLAS_ROWS = 3
 
 AIR = 0
 GRASS = 1
@@ -345,6 +367,19 @@ class Player:
     look_y: float = 0.0
     look_z: float = -1.0
     on_ground: bool = False
+    mining_target: Optional[Vec3i] = None
+    mining_progress: float = 0.0
+    break_pulse: float = 0.0
+    mouse_settle_frames: int = 0
+    coyote_timer: float = 0.0
+    jump_buffer_timer: float = 0.0
+    jump_was_down: bool = False
+    health: float = PLAYER_MAX_HEALTH
+    up_x: float = 0.0
+    up_y: float = 1.0
+    up_z: float = 0.0
+    death_fade_timer: float = 0.0
+    death_hold_timer: float = 0.0
 
 
 class ChunkMesh:
@@ -369,9 +404,11 @@ class ChunkMesh:
 class Game:
     def __init__(self) -> None:
         pygame.init()
+        pygame.joystick.init()
         self.width = 1280
         self.height = 720
-        self.screen_center = (self.width // 2, self.height // 2)
+        # Player 1 uses the left half of split-screen; lock mouse to that view.
+        self.screen_center = (self.width // 4, self.height // 2)
         pygame.display.set_mode((self.width, self.height), DOUBLEBUF | OPENGL)
         pygame.display.set_caption("Not Minecraft (OpenGL)")
         pygame.event.set_grab(True)
@@ -399,7 +436,7 @@ class Game:
         glClearColor(0.26, 0.09, 0.07, 1.0)
 
         glMatrixMode(GL_PROJECTION)
-        gluPerspective(75.0, self.width / self.height, 0.05, 450.0)
+        gluPerspective(FOV_DEG, self.width / self.height, 0.05, 450.0)
         glMatrixMode(GL_MODELVIEW)
 
         self.texture_atlas = self.create_texture_atlas()
@@ -408,23 +445,77 @@ class Game:
         self.world = World(seed=2106)
         self.world.generate()
 
-        spawn = self.find_spawn_point()
-        self.player = Player(spawn[0], spawn[1], spawn[2], look_x=0.0, look_y=0.0, look_z=-1.0)
-        self.stabilize_player_spawn()
+        axis = random.randint(0, 2)
+        sign_a = 1 if random.random() < 0.5 else -1
+        sign_b = -sign_a
+        self.spawn_faces = [(axis, sign_a), (axis, sign_b)]
+        all_faces: List[Tuple[int, int]] = [(0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)]
+        self.hazard_faces: Set[Tuple[int, int]] = {f for f in all_faces if f not in self.spawn_faces}
+        spawn_a = self.find_spawn_point(axis, sign_a)
+        spawn_b = self.find_spawn_point(axis, sign_b)
+        self.players: List[Player] = [
+            Player(spawn_a[0], spawn_a[1], spawn_a[2], look_x=-1.0, look_y=0.0, look_z=0.0, mouse_settle_frames=3),
+            Player(spawn_b[0], spawn_b[1], spawn_b[2], look_x=1.0, look_y=0.0, look_z=0.0, mouse_settle_frames=0),
+        ]
+        self.reset_player_up(0)
+        self.reset_player_up(1)
+        self.stabilize_player_spawn(0)
+        self.stabilize_player_spawn(1)
+        self.reset_player_up(0)
+        self.reset_player_up(1)
+        self.initial_spawn_points: List[Vec3f] = [self.player_pos(0), self.player_pos(1)]
 
         self.chunk_meshes: Dict[ChunkKey, ChunkMesh] = {}
         self.dirty_chunks: Set[ChunkKey] = set()
         self.build_all_chunk_meshes()
         self.mines: Dict[Vec3i, Dict[str, object]] = {}
+        self.xray_beams: List[Dict[str, object]] = []
+        self.populate_xray_mines()
 
         self.selected_block = DIRT
-        self.mining_target: Optional[Vec3i] = None
-        self.mining_progress = 0.0
-        self.break_pulse = 0.0
         self.break_particles: List[Dict[str, float]] = []
         self.explosion_particles: List[Dict[str, float]] = []
-        self.mouse_settle_frames = 3
+        self.gamepads: List[pygame.joystick.Joystick] = []
+        self.p1_pad: Optional[pygame.joystick.Joystick] = None
+        self.p2_pad: Optional[pygame.joystick.Joystick] = None
+        self.pad_prev_buttons: List[Dict[int, bool]] = [{}, {}]
+        self.refresh_gamepads()
+        self.show_player_lines = False
         self.running = True
+
+    def refresh_gamepads(self) -> None:
+        self.gamepads = []
+        count = pygame.joystick.get_count()
+        for i in range(count):
+            js = pygame.joystick.Joystick(i)
+            js.init()
+            self.gamepads.append(js)
+
+        if len(self.gamepads) >= 2:
+            self.p1_pad = self.gamepads[0]
+            self.p2_pad = self.gamepads[1]
+        elif len(self.gamepads) == 1:
+            self.p1_pad = None
+            self.p2_pad = self.gamepads[0]
+        else:
+            self.p1_pad = None
+            self.p2_pad = None
+
+    def read_axis(self, pad: Optional[pygame.joystick.Joystick], idx: int) -> float:
+        if pad is None or idx >= pad.get_numaxes():
+            return 0.0
+        v = float(pad.get_axis(idx))
+        if abs(v) < GAMEPAD_DEADZONE:
+            return 0.0
+        return v
+
+    def read_button(self, pad: Optional[pygame.joystick.Joystick], idx: int) -> bool:
+        return bool(pad is not None and idx < pad.get_numbuttons() and pad.get_button(idx))
+
+    def edge_button(self, player_idx: int, btn: int, now: bool) -> bool:
+        prev = self.pad_prev_buttons[player_idx].get(btn, False)
+        self.pad_prev_buttons[player_idx][btn] = now
+        return now and not prev
 
     def make_lofi_tile(self, seed: int, base: Tuple[int, int, int], hi: Tuple[int, int, int], lo: Tuple[int, int, int]) -> bytearray:
         tile = bytearray(TEX_SIZE * TEX_SIZE * 3)
@@ -456,6 +547,7 @@ class Game:
             1: self.make_lofi_tile(903, (78, 42, 28), (118, 60, 36), (49, 24, 17)),
             2: self.make_lofi_tile(907, (64, 54, 49), (88, 74, 66), (40, 32, 29)),
             3: self.make_lofi_tile(911, (82, 50, 30), (112, 70, 42), (52, 31, 19)),
+            4: self.make_lofi_tile(947, (108, 138, 22), (190, 164, 34), (58, 84, 14)),
         }
 
         for tile_idx, tile_data in tiles.items():
@@ -524,17 +616,44 @@ class Game:
                         elif ny == 0:
                             shade = 0.82
 
+                        face_tex_idx = tex_idx
                         r = base[0] * shade
                         g = base[1] * shade
                         b = base[2] * shade
+                        if self.is_hazard_outer_face(x, y, z, nx, ny, nz):
+                            face_tex_idx = HAZARD_TEX_INDEX
+                            r = lerp(r, HAZARD_TINT[0], 0.95)
+                            g = lerp(g, HAZARD_TINT[1], 0.98)
+                            b = lerp(b, HAZARD_TINT[2], 0.92)
 
                         for idx in TRI_IDX:
                             vx, vy, vz = face[idx]
                             uv = UV_QUAD[idx]
-                            uu, vv = self.atlas_uv(tex_idx, uv[0], uv[1])
+                            uu, vv = self.atlas_uv(face_tex_idx, uv[0], uv[1])
                             verts.extend((x + vx, y + vy, z + vz, nx, ny, nz, uu, vv, r, g, b))
 
         mesh.upload(verts)
+
+    def is_hazard_outer_face(self, x: int, y: int, z: int, nx: int, ny: int, nz: int) -> bool:
+        if nx != 0:
+            axis = 0
+            sign = 1 if nx > 0 else -1
+            face_coord = x + 1 if nx > 0 else x
+            center = self.world.cx
+        elif ny != 0:
+            axis = 1
+            sign = 1 if ny > 0 else -1
+            face_coord = y + 1 if ny > 0 else y
+            center = self.world.cy
+        else:
+            axis = 2
+            sign = 1 if nz > 0 else -1
+            face_coord = z + 1 if nz > 0 else z
+            center = self.world.cz
+
+        if (axis, sign) not in self.hazard_faces:
+            return False
+        return sign * (face_coord - center) >= CUBE_HALF
 
     def mark_chunk_dirty(self, key: ChunkKey) -> None:
         cx, cz = key
@@ -570,24 +689,31 @@ class Game:
             key = self.dirty_chunks.pop()
             self.rebuild_chunk_mesh(key)
 
-    def player_pos(self) -> Vec3f:
-        return (self.player.x, self.player.y, self.player.z)
+    def player_pos(self, idx: int) -> Vec3f:
+        p = self.players[idx]
+        return (p.x, p.y, p.z)
 
-    def set_player_pos(self, p: Vec3f) -> None:
-        self.player.x, self.player.y, self.player.z = p
+    def set_player_pos(self, idx: int, p: Vec3f) -> None:
+        self.players[idx].x, self.players[idx].y, self.players[idx].z = p
 
-    def player_vel(self) -> Vec3f:
-        return (self.player.vx, self.player.vy, self.player.vz)
+    def player_vel(self, idx: int) -> Vec3f:
+        p = self.players[idx]
+        return (p.vx, p.vy, p.vz)
 
-    def set_player_vel(self, v: Vec3f) -> None:
-        self.player.vx, self.player.vy, self.player.vz = v
+    def set_player_vel(self, idx: int, v: Vec3f) -> None:
+        self.players[idx].vx, self.players[idx].vy, self.players[idx].vz = v
 
-    def look_dir(self) -> Vec3f:
-        return v_norm((self.player.look_x, self.player.look_y, self.player.look_z))
+    def player_alive(self, idx: int) -> bool:
+        p = self.players[idx]
+        return p.death_fade_timer <= 0.0 and p.death_hold_timer <= 0.0
 
-    def set_look_dir(self, d: Vec3f) -> None:
+    def look_dir(self, idx: int) -> Vec3f:
+        p = self.players[idx]
+        return v_norm((p.look_x, p.look_y, p.look_z))
+
+    def set_look_dir(self, idx: int, d: Vec3f) -> None:
         dn = v_norm(d)
-        self.player.look_x, self.player.look_y, self.player.look_z = dn
+        self.players[idx].look_x, self.players[idx].look_y, self.players[idx].look_z = dn
 
     def snap_axis_dir(self, vec: Vec3f, avoid: Tuple[Vec3i, ...] = ()) -> Vec3i:
         candidates = [
@@ -607,9 +733,11 @@ class Game:
                 return axis
         return candidates[0][1]
 
-    def place_mine(self) -> None:
-        pos = self.player_pos()
-        fwd, right, up = self.camera_basis(pos)
+    def place_mine(self, player_idx: int) -> None:
+        if not self.player_alive(player_idx):
+            return
+        pos = self.player_pos(player_idx)
+        fwd, right, up = self.camera_basis(player_idx, pos)
         up_i = self.snap_axis_dir(up)
         right_i = self.snap_axis_dir(right, (up_i,))
         fwd_i = self.snap_axis_dir(fwd, (up_i, right_i))
@@ -618,7 +746,7 @@ class Game:
         key = (base[0] + fwd_i[0], base[1] + fwd_i[1], base[2] + fwd_i[2])
         if not self.world.in_bounds(*key):
             return
-        if self.player_intersects(*key):
+        if self.player_intersects(player_idx, *key):
             return
         if key in self.mines:
             return
@@ -640,6 +768,8 @@ class Game:
                 return
 
         self.mines[key] = {
+            "kind": "timed",
+            "owner": player_idx,
             "pos": key,
             "timer": MINE_FUSE_SECONDS,
             "up": up_i,
@@ -648,6 +778,99 @@ class Game:
             "normal": normal,
             "support": support,
         }
+
+    def populate_xray_mines(self) -> None:
+        if not self.hazard_faces:
+            return
+        for axis, sign in self.hazard_faces:
+            placed = 0
+            tries = 0
+            max_tries = XRAY_MINE_COUNT_PER_FACE * 48
+            while placed < XRAY_MINE_COUNT_PER_FACE and tries < max_tries:
+                tries += 1
+                support = self.random_face_support(axis, sign)
+                if support is None:
+                    continue
+                mine_pos = (
+                    support[0] + (sign if axis == 0 else 0),
+                    support[1] + (sign if axis == 1 else 0),
+                    support[2] + (sign if axis == 2 else 0),
+                )
+                if not self.world.in_bounds(*mine_pos):
+                    continue
+                if self.world.block_at(*mine_pos) != AIR or mine_pos in self.mines:
+                    continue
+                if any(self.player_intersects(i, *mine_pos) for i in range(len(self.players))):
+                    continue
+
+                n = (sign if axis == 0 else 0, sign if axis == 1 else 0, sign if axis == 2 else 0)
+                ref = (0.0, 1.0, 0.0) if abs(n[1]) < 0.9 else (1.0, 0.0, 0.0)
+                tangent_u = v_norm(v_cross(ref, (float(n[0]), float(n[1]), float(n[2]))))
+                tangent_v = v_norm(v_cross((float(n[0]), float(n[1]), float(n[2])), tangent_u))
+                up_i = self.snap_axis_dir((float(n[0]), float(n[1]), float(n[2])))
+                right_i = self.snap_axis_dir(tangent_u, (up_i,))
+                fwd_i = self.snap_axis_dir(tangent_v, (up_i, right_i))
+
+                self.mines[mine_pos] = {
+                    "kind": "xray",
+                    "owner": -1,
+                    "pos": mine_pos,
+                    "normal": n,
+                    "support": support,
+                    "up": up_i,
+                    "right": right_i,
+                    "forward": fwd_i,
+                }
+                placed += 1
+
+    def trigger_xray_mine(self, mine: Dict[str, object], source_player_idx: int) -> None:
+        pos = mine.get("pos")
+        if not isinstance(pos, tuple):
+            return
+        if pos not in self.mines:
+            return
+        self.mines.pop(pos, None)
+
+        up = mine.get("up")
+        right = mine.get("right")
+        fwd = mine.get("forward")
+        if not isinstance(up, tuple) or not isinstance(right, tuple) or not isinstance(fwd, tuple):
+            return
+
+        origin = (pos[0] + 0.5, pos[1] + 0.5, pos[2] + 0.5)
+        dirs = [
+            right,
+            (-right[0], -right[1], -right[2]),
+            fwd,
+            (-fwd[0], -fwd[1], -fwd[2]),
+            (-up[0], -up[1], -up[2]),
+        ]
+        hit_players: Set[int] = set()
+        segments: List[Tuple[Vec3f, Vec3f]] = []
+        for d in dirs:
+            end = origin
+            for i in range(1, XRAY_RAY_RANGE + 1):
+                cell = (pos[0] + d[0] * i, pos[1] + d[1] * i, pos[2] + d[2] * i)
+                if not self.world.in_bounds(*cell):
+                    break
+                end = (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5)
+                for pidx in range(len(self.players)):
+                    if not self.player_alive(pidx):
+                        continue
+                    if self.player_intersects(pidx, *cell) or self.player_in_blast_cell(pidx, *cell):
+                        hit_players.add(pidx)
+            segments.append((origin, end))
+
+        for pidx in hit_players:
+            self.kill_player(pidx)
+        self.xray_beams.append(
+            {
+                "segments": segments,
+                "life": XRAY_BEAM_DURATION,
+                "ttl": XRAY_BEAM_DURATION,
+                "owner": source_player_idx,
+            }
+        )
 
     def mine_anchor_cell(self, mine: Dict[str, object]) -> Optional[Vec3i]:
         support = mine.get("support")
@@ -663,18 +886,25 @@ class Game:
 
     def detonate_mine(self, mine: Dict[str, object]) -> None:
         pos = mine["pos"]
-        up = mine["up"]
-        right = mine["right"]
-        fwd = mine["forward"]
-        if not isinstance(pos, tuple) or not isinstance(up, tuple) or not isinstance(right, tuple) or not isinstance(fwd, tuple):
+        if not isinstance(pos, tuple):
             return
 
         if pos not in self.mines:
             return
+        if str(mine.get("kind", "timed")) == "xray":
+            return
         self.mines.pop(pos, None)
 
+        fx_owner_obj = mine.get("owner")
+        fx_owner = int(fx_owner_obj) if isinstance(fx_owner_obj, int) and 0 <= fx_owner_obj < len(self.players) else None
         cells: Set[Vec3i] = set()
         cell_dirs: Dict[Vec3i, Vec3i] = {}
+        up = mine["up"]
+        right = mine["right"]
+        fwd = mine["forward"]
+        if not isinstance(up, tuple) or not isinstance(right, tuple) or not isinstance(fwd, tuple):
+            return
+
         cells.add(pos)
         cell_dirs[pos] = (0, 0, 0)
         for i in range(1, 4):
@@ -711,28 +941,28 @@ class Game:
                         cell_dirs.setdefault(cell, d)
                     break
 
-        blast_breaks_rock = False
-        player_hit = False
+        hit_players: Set[int] = set()
         for cx, cy, cz in cells:
             if not self.world.in_bounds(cx, cy, cz):
                 continue
             block = self.world.block_at(cx, cy, cz)
-            if block == STONE:
-                blast_breaks_rock = True
-            if self.player_intersects(cx, cy, cz):
-                player_hit = True
+            for i in range(len(self.players)):
+                if not self.player_alive(i):
+                    continue
+                if self.player_intersects(i, cx, cy, cz) or self.player_in_blast_cell(i, cx, cy, cz):
+                    hit_players.add(i)
 
-        if blast_breaks_rock and player_hit:
-            self.kill_player()
+        for i in hit_players:
+            self.kill_player(i)
 
-        # Visual blast follows the same pattern: restrained center, stronger directional arms.
-        self.spawn_explosion_effect((pos[0] + 0.5, pos[1] + 0.5, pos[2] + 0.5), scale=0.55, axis=None)
+        # Visual blast follows each mine's damage pattern.
+        self.spawn_explosion_effect((pos[0] + 0.5, pos[1] + 0.5, pos[2] + 0.5), scale=0.55, axis=None, player_idx=fx_owner)
         for (cx, cy, cz), axis_dir in cell_dirs.items():
             if (cx, cy, cz) == pos:
                 continue
             dist = abs(cx - pos[0]) + abs(cy - pos[1]) + abs(cz - pos[2])
             scale = max(0.22, 1.0 - dist * 0.06)
-            self.spawn_explosion_effect((cx + 0.5, cy + 0.5, cz + 0.5), scale=scale, axis=axis_dir)
+            self.spawn_explosion_effect((cx + 0.5, cy + 0.5, cz + 0.5), scale=scale, axis=axis_dir, player_idx=fx_owner)
 
         for cx, cy, cz in cells:
             if not self.world.in_bounds(cx, cy, cz):
@@ -744,7 +974,7 @@ class Game:
                 self.set_world_block(cx, cy, cz, CHARRED_STONE)
             else:
                 self.set_world_block(cx, cy, cz, AIR)
-            self.spawn_break_feedback((cx, cy, cz), block)
+            self.spawn_break_feedback((cx, cy, cz), block, fx_owner)
 
         # Chain reaction: any armed mine inside blast cells detonates immediately.
         chained_positions = [cell for cell in cells if cell in self.mines]
@@ -753,30 +983,112 @@ class Game:
             if chained is not None:
                 self.detonate_mine(chained)
 
-    def kill_player(self) -> None:
-        self.running = False
+    def kill_player(self, player_idx: int) -> None:
+        p = self.players[player_idx]
+        if not self.player_alive(player_idx):
+            return
+        p.vx = p.vy = p.vz = 0.0
+        p.on_ground = False
+        p.mining_target = None
+        p.mining_progress = 0.0
+        p.break_pulse = 0.0
+        p.health = 0.0
+        p.death_fade_timer = DEATH_FADE_SECONDS
+        p.death_hold_timer = DEATH_BLACKOUT_SECONDS
+
+    def respawn_player(self, player_idx: int) -> None:
+        spawn = self.initial_spawn_points[player_idx]
+        p = self.players[player_idx]
+        p.x, p.y, p.z = spawn
+        p.vx = p.vy = p.vz = 0.0
+        p.on_ground = False
+        p.mining_target = None
+        p.mining_progress = 0.0
+        p.break_pulse = 0.0
+        p.health = PLAYER_MAX_HEALTH
+        p.death_fade_timer = 0.0
+        p.death_hold_timer = 0.0
+        self.reset_player_up(player_idx)
+        self.stabilize_player_spawn(player_idx)
+        self.reset_player_up(player_idx)
+
+    def update_respawns(self, dt: float) -> None:
+        for i, p in enumerate(self.players):
+            if self.player_alive(i):
+                continue
+            if p.death_fade_timer > 0.0:
+                p.death_fade_timer = max(0.0, p.death_fade_timer - dt)
+            elif p.death_hold_timer > 0.0:
+                p.death_hold_timer = max(0.0, p.death_hold_timer - dt)
+            if p.death_fade_timer <= 0.0 and p.death_hold_timer <= 0.0:
+                self.respawn_player(i)
 
     def update_mines(self, dt: float) -> None:
         if not self.mines:
             return
         unsupported: List[Vec3i] = []
         to_detonate: List[Dict[str, object]] = []
-        for mine in self.mines.values():
+        for mine in list(self.mines.values()):
             if not self.mine_has_support(mine):
                 pos = mine.get("pos")
                 if isinstance(pos, tuple):
                     unsupported.append(pos)
                 continue
-            t = float(mine["timer"]) - dt
-            mine["timer"] = t
-            if t <= 0.0:
-                to_detonate.append(mine)
+            kind = str(mine.get("kind", "timed"))
+            if kind == "xray":
+                pos = mine.get("pos")
+                if not isinstance(pos, tuple):
+                    continue
+                center = (pos[0] + 0.5, pos[1] + 0.5, pos[2] + 0.5)
+                for i, p in enumerate(self.players):
+                    if not self.player_alive(i):
+                        continue
+                    d2 = (p.x - center[0]) ** 2 + (p.y - center[1]) ** 2 + (p.z - center[2]) ** 2
+                    if d2 <= XRAY_TRIGGER_RANGE * XRAY_TRIGGER_RANGE:
+                        self.trigger_xray_mine(mine, i)
+                        break
+            else:
+                t = float(mine["timer"]) - dt
+                mine["timer"] = t
+                if t <= 0.0:
+                    to_detonate.append(mine)
 
         for pos in unsupported:
             self.mines.pop(pos, None)
 
         for mine in to_detonate:
             self.detonate_mine(mine)
+
+    def face_for_position(self, pos: Vec3f) -> Tuple[int, int]:
+        rel = (pos[0] - self.world.cx, pos[1] - self.world.cy, pos[2] - self.world.cz)
+        axis = 0
+        if abs(rel[1]) > abs(rel[axis]):
+            axis = 1
+        if abs(rel[2]) > abs(rel[axis]):
+            axis = 2
+        sign = 1 if rel[axis] >= 0.0 else -1
+        return (axis, sign)
+
+    def update_hazard_damage(self, dt: float) -> None:
+        for i, p in enumerate(self.players):
+            if not self.player_alive(i):
+                continue
+            pos = self.player_pos(i)
+            face = self.face_for_position(pos)
+            if face not in self.hazard_faces:
+                continue
+            g = self.player_gravity_dir(i, pos)
+            # Robust contact test: use movement-grounded state plus two collision probes.
+            touching = (
+                p.on_ground
+                or self.collides_body(v_add(pos, v_scale(g, 0.10)))
+                or self.collides_body(v_add(pos, v_scale(g, 0.24)))
+            )
+            if not touching:
+                continue
+            p.health -= HAZARD_CONTACT_DPS * dt
+            if p.health <= 0.0:
+                self.kill_player(i)
 
     def outward_up(self, pos: Vec3f) -> Vec3f:
         rel = (pos[0] - self.world.cx, pos[1] - self.world.cy, pos[2] - self.world.cz)
@@ -789,13 +1101,38 @@ class Game:
         nz = math.copysign((az / m) ** GRAVITY_BLEND_POWER, rel[2])
         return v_norm((nx, ny, nz))
 
+    def reset_player_up(self, player_idx: int) -> None:
+        up = self.outward_up(self.player_pos(player_idx))
+        p = self.players[player_idx]
+        p.up_x, p.up_y, p.up_z = up
+
+    def player_up(self, player_idx: int, pos: Optional[Vec3f] = None) -> Vec3f:
+        p = self.players[player_idx]
+        up = v_norm((p.up_x, p.up_y, p.up_z))
+        if v_len(up) < 1e-6:
+            return self.outward_up(self.player_pos(player_idx) if pos is None else pos)
+        return up
+
+    def update_player_up_smoothing(self, dt: float) -> None:
+        alpha = 1.0 - math.exp(-UP_SMOOTH_RATE * dt)
+        for i, p in enumerate(self.players):
+            pos = self.player_pos(i)
+            target = self.outward_up(pos)
+            cur = self.player_up(i, pos)
+            blended = v_norm(v_add(v_scale(cur, 1.0 - alpha), v_scale(target, alpha)))
+            p.up_x, p.up_y, p.up_z = blended
+
     def gravity_dir(self, pos: Vec3f) -> Vec3f:
         up = self.outward_up(pos)
         return (-up[0], -up[1], -up[2])
 
-    def camera_basis(self, pos: Vec3f) -> Tuple[Vec3f, Vec3f, Vec3f]:
-        up = self.outward_up(pos)
-        look = self.look_dir()
+    def player_gravity_dir(self, player_idx: int, pos: Vec3f) -> Vec3f:
+        up = self.player_up(player_idx, pos)
+        return (-up[0], -up[1], -up[2])
+
+    def camera_basis(self, player_idx: int, pos: Vec3f) -> Tuple[Vec3f, Vec3f, Vec3f]:
+        up = self.player_up(player_idx, pos)
+        look = self.look_dir(player_idx)
 
         fwd = v_sub(look, v_scale(up, v_dot(look, up)))
         if v_len(fwd) < 1e-5:
@@ -806,31 +1143,67 @@ class Game:
         right = v_norm(v_cross(fwd, up))
         return (fwd, right, up)
 
-    def eye_pos(self) -> Vec3f:
-        pos = self.player_pos()
-        up = self.outward_up(pos)
+    def eye_pos(self, player_idx: int) -> Vec3f:
+        pos = self.player_pos(player_idx)
+        up = self.player_up(player_idx, pos)
         return v_add(pos, v_scale(up, PLAYER_EYE_OFFSET))
 
     def handle_mouse_look(self) -> None:
-        if self.mouse_settle_frames > 0:
+        if not self.player_alive(0):
+            pygame.mouse.set_pos(self.screen_center)
+            pygame.mouse.get_rel()
+            return
+        p = self.players[0]
+        if p.mouse_settle_frames > 0:
             pygame.mouse.set_pos(self.screen_center)
             pygame.event.clear(pygame.MOUSEMOTION)
             pygame.mouse.get_rel()
-            self.mouse_settle_frames -= 1
+            p.mouse_settle_frames -= 1
             return
 
-        mx, my = pygame.mouse.get_rel()
+        mx_pos, my_pos = pygame.mouse.get_pos()
+        mx = mx_pos - self.screen_center[0]
+        my = my_pos - self.screen_center[1]
+        pygame.mouse.set_pos(self.screen_center)
         if mx == 0 and my == 0:
             return
 
-        pos = self.player_pos()
-        fwd, right, up = self.camera_basis(pos)
+        pos = self.player_pos(0)
+        fwd, right, up = self.camera_basis(0, pos)
 
-        look = self.look_dir()
+        look = self.look_dir(0)
         look = rotate_axis(look, up, -mx * MOUSE_SENS)
-        look = rotate_axis(look, right, -my * MOUSE_SENS)
+        look = rotate_axis(look, right, my * MOUSE_SENS)
+        look = self.stabilize_view_direction(0, look)
 
-        self.set_look_dir(look)
+        self.set_look_dir(0, look)
+
+    def handle_gamepad_look(self, player_idx: int, look_x: float, look_y: float, dt: float) -> None:
+        if not self.player_alive(player_idx):
+            return
+        if look_x == 0 and look_y == 0:
+            return
+
+        pos = self.player_pos(player_idx)
+        _, right, up = self.camera_basis(player_idx, pos)
+        look = self.look_dir(player_idx)
+        look = rotate_axis(look, up, -look_x * GAMEPAD_LOOK_SPEED * dt)
+        look = rotate_axis(look, right, look_y * GAMEPAD_LOOK_SPEED * dt)
+        look = self.stabilize_view_direction(player_idx, look)
+        self.set_look_dir(player_idx, look)
+
+    def stabilize_view_direction(self, player_idx: int, look: Vec3f) -> Vec3f:
+        _ = player_idx
+        return v_norm(look)
+
+    def place_block(self, player_idx: int) -> None:
+        if not self.player_alive(player_idx):
+            return
+        _, prev = self.raycast_block(REACH, player_idx)
+        if prev:
+            px, py, pz = prev
+            if self.world.block_at(px, py, pz) == AIR and not self.player_intersects(player_idx, px, py, pz):
+                self.set_world_block(px, py, pz, self.selected_block)
 
     def process_input(self, dt: float) -> None:
         for event in pygame.event.get():
@@ -838,6 +1211,8 @@ class Game:
                 self.running = False
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 self.running = False
+            elif event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
+                self.refresh_gamepads()
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_1:
                     self.selected_block = DIRT
@@ -846,47 +1221,157 @@ class Game:
                 elif event.key == pygame.K_3:
                     self.selected_block = WOOD
                 elif event.key == pygame.K_e:
-                    self.place_mine()
+                    self.place_mine(0)
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                hit, prev = self.raycast_block(REACH)
-                if event.button == 3 and prev:
-                    px, py, pz = prev
-                    if self.world.block_at(px, py, pz) == AIR and not self.player_intersects(px, py, pz):
-                        self.set_world_block(px, py, pz, self.selected_block)
+                if event.button == 3:
+                    self.place_block(0)
 
         self.handle_mouse_look()
-
         keys = pygame.key.get_pressed()
-        move_x = (1 if keys[pygame.K_d] else 0) - (1 if keys[pygame.K_a] else 0)
-        move_z = (1 if keys[pygame.K_w] else 0) - (1 if keys[pygame.K_s] else 0)
+        self.show_player_lines = bool(keys[pygame.K_PERIOD])
 
-        pos = self.player_pos()
-        fwd, right, up = self.camera_basis(pos)
-        gravity = self.gravity_dir(pos)
+        p1_move_x = float((1 if keys[pygame.K_d] else 0) - (1 if keys[pygame.K_a] else 0))
+        p1_move_z = float((1 if keys[pygame.K_w] else 0) - (1 if keys[pygame.K_s] else 0))
+        p1_jump = bool(keys[pygame.K_SPACE])
+        p1_mine_hold = bool(pygame.mouse.get_pressed(3)[0])
+
+        p2_move_x = 0.0
+        p2_move_z = 0.0
+        p2_jump = False
+        p2_mine_hold = False
+
+        # Optional gamepad controls for Player 1 (keyboard/mouse still work).
+        if self.p1_pad is not None:
+            gp_mx = self.read_axis(self.p1_pad, 0)
+            gp_mz = -self.read_axis(self.p1_pad, 1)
+            p1_move_x = clamp(p1_move_x + gp_mx, -1.0, 1.0)
+            p1_move_z = clamp(p1_move_z + gp_mz, -1.0, 1.0)
+            p1_jump = p1_jump or self.read_button(self.p1_pad, 0)
+            p1_mine_hold = p1_mine_hold or self.read_button(self.p1_pad, 5)
+
+            lx = self.read_axis(self.p1_pad, 2)
+            ly = self.read_axis(self.p1_pad, 3)
+            self.handle_gamepad_look(0, lx, ly, dt)
+
+            if self.edge_button(0, 2, self.read_button(self.p1_pad, 2)):
+                self.place_block(0)
+            if self.edge_button(0, 3, self.read_button(self.p1_pad, 3)):
+                self.place_mine(0)
+            if self.edge_button(0, 1, self.read_button(self.p1_pad, 1)):
+                self.selected_block = DIRT if self.selected_block == WOOD else self.selected_block + 1
+            if self.edge_button(0, 4, self.read_button(self.p1_pad, 4)):
+                self.selected_block = WOOD if self.selected_block == DIRT else self.selected_block - 1
+
+        # Player 2 must use gamepad.
+        if self.p2_pad is not None:
+            p2_move_x = self.read_axis(self.p2_pad, 0)
+            p2_move_z = -self.read_axis(self.p2_pad, 1)
+            p2_jump = self.read_button(self.p2_pad, 0)
+            p2_mine_hold = self.read_button(self.p2_pad, 5)
+
+            lx2 = self.read_axis(self.p2_pad, 2)
+            ly2 = self.read_axis(self.p2_pad, 3)
+            self.handle_gamepad_look(1, lx2, ly2, dt)
+
+            if self.edge_button(1, 2, self.read_button(self.p2_pad, 2)):
+                self.place_block(1)
+            if self.edge_button(1, 3, self.read_button(self.p2_pad, 3)):
+                self.place_mine(1)
+            if self.edge_button(1, 1, self.read_button(self.p2_pad, 1)):
+                self.selected_block = DIRT if self.selected_block == WOOD else self.selected_block + 1
+            if self.edge_button(1, 4, self.read_button(self.p2_pad, 4)):
+                self.selected_block = WOOD if self.selected_block == DIRT else self.selected_block - 1
+
+        self.update_player_movement(
+            player_idx=0,
+            move_x=p1_move_x,
+            move_z=p1_move_z,
+            jump_pressed=p1_jump,
+            dt=dt,
+        )
+        self.update_player_movement(
+            player_idx=1,
+            move_x=p2_move_x,
+            move_z=p2_move_z,
+            jump_pressed=p2_jump,
+            dt=dt,
+        )
+
+        self.update_mining(0, dt, p1_mine_hold)
+        self.update_mining(1, dt, p2_mine_hold)
+
+    def update_player_movement(self, player_idx: int, move_x: float, move_z: float, jump_pressed: bool, dt: float) -> None:
+        p = self.players[player_idx]
+        if not self.player_alive(player_idx):
+            self.set_player_vel(player_idx, (0.0, 0.0, 0.0))
+            return
+        pos = self.player_pos(player_idx)
+        fwd, right, up = self.camera_basis(player_idx, pos)
+        gravity = self.player_gravity_dir(player_idx, pos)
+        no_input = False
+
+        if math.sqrt(move_x * move_x + move_z * move_z) < MOVE_INPUT_DEADZONE:
+            move_x = 0.0
+            move_z = 0.0
+            no_input = True
+
+        support_now = self.collides_body(v_add(pos, v_scale(gravity, 0.14)))
+        if support_now:
+            p.coyote_timer = COYOTE_TIME
+        else:
+            p.coyote_timer = max(0.0, p.coyote_timer - dt)
+
+        jump_pressed_edge = jump_pressed and not p.jump_was_down
+        p.jump_was_down = jump_pressed
+        if jump_pressed_edge:
+            p.jump_buffer_timer = JUMP_BUFFER_TIME
+        else:
+            p.jump_buffer_timer = max(0.0, p.jump_buffer_timer - dt)
+
+        if no_input and support_now and not jump_pressed:
+            p.on_ground = True
+            self.set_player_vel(player_idx, (0.0, 0.0, 0.0))
+            return
 
         wish = (0.0, 0.0, 0.0)
         wish = v_add(wish, v_scale(fwd, float(move_z)))
         wish = v_add(wish, v_scale(right, float(move_x)))
         if v_len(wish) > 0.001:
             wish = v_scale(v_norm(wish), PLAYER_SPEED)
+        else:
+            wish = (0.0, 0.0, 0.0)
 
-        vel = self.player_vel()
+        vel = self.player_vel(player_idx)
         gspeed = v_dot(vel, gravity)
         vel = v_add(wish, v_scale(gravity, gspeed))
+        if no_input:
+            # Hard-remove any sideways creep when there is no intended movement.
+            vel = v_scale(gravity, gspeed)
 
-        if self.player.on_ground and keys[pygame.K_SPACE]:
+        can_jump = p.coyote_timer > 0.0
+        if can_jump and p.jump_buffer_timer > 0.0:
             vel = v_add(vel, v_scale(up, JUMP_SPEED))
-            self.player.on_ground = False
+            p.on_ground = False
+            p.coyote_timer = 0.0
+            p.jump_buffer_timer = 0.0
 
-        vel = v_add(vel, v_scale(gravity, GRAVITY * dt))
-        self.set_player_vel(vel)
+        gmult = 1.0
+        if gspeed > 0.0:
+            gmult = FALL_GRAVITY_MULT
+        elif gspeed < 0.0 and not jump_pressed:
+            gmult = JUMP_CUT_GRAVITY_MULT
+        vel = v_add(vel, v_scale(gravity, GRAVITY * gmult * dt))
+        self.set_player_vel(player_idx, vel)
 
         delta = v_scale(vel, dt)
-        self.move_and_collide(delta)
-        self.update_mining(dt, pygame.mouse.get_pressed(3)[0])
+        self.move_and_collide(player_idx, delta)
 
-        pos = self.player_pos()
-        self.player.on_ground = self.collides_body(v_add(pos, v_scale(self.gravity_dir(pos), 0.08)))
+        pos2 = self.player_pos(player_idx)
+        g2 = self.player_gravity_dir(player_idx, pos2)
+        support_near = self.collides_body(v_add(pos2, v_scale(g2, 0.14)))
+        p.on_ground = support_near
+        if no_input and support_near:
+            self.set_player_vel(player_idx, (0.0, 0.0, 0.0))
 
     def mine_time_for(self, block: int) -> float:
         if block in (STONE, CHARRED_STONE):
@@ -895,15 +1380,16 @@ class Game:
             return MINE_TIME_WOOD
         return MINE_TIME_DIRT
 
-    def spawn_break_feedback(self, cell: Vec3i, block: int) -> None:
+    def spawn_break_feedback(self, cell: Vec3i, block: int, player_idx: Optional[int] = None) -> None:
         cx = cell[0] + 0.5
         cy = cell[1] + 0.5
         cz = cell[2] + 0.5
         base = BLOCK_COLORS.get(block, (0.45, 0.35, 0.25))
-        eye = self.eye_pos()
+        eye_idx = 0 if player_idx is None else player_idx
+        eye = self.eye_pos(eye_idx)
         outward = v_norm((cx - eye[0], cy - eye[1], cz - eye[2]))
         if v_len(outward) < 1e-5:
-            outward = self.look_dir()
+            outward = self.look_dir(eye_idx)
         is_dirt_break = block in (DIRT, GRASS)
         count = BREAK_PARTICLE_COUNT + (DIRT_PARTICLE_BONUS if is_dirt_break else 0)
 
@@ -931,13 +1417,19 @@ class Game:
                     "g": base[1] * g_mul,
                     "b": base[2] * b_mul,
                     "d": 1.0 if is_dirt_break else 0.0,
+                    "owner": -1 if player_idx is None else player_idx,
                 }
             )
-        self.break_pulse = 1.0
+        if player_idx is None:
+            for p in self.players:
+                p.break_pulse = max(p.break_pulse, 0.55)
+        else:
+            self.players[player_idx].break_pulse = max(self.players[player_idx].break_pulse, 1.0)
 
     def update_break_feedback(self, dt: float) -> None:
-        if self.break_pulse > 0.0:
-            self.break_pulse = max(0.0, self.break_pulse - dt * 4.8)
+        for p in self.players:
+            if p.break_pulse > 0.0:
+                p.break_pulse = max(0.0, p.break_pulse - dt * 4.8)
 
         if not self.break_particles:
             return
@@ -959,7 +1451,7 @@ class Game:
 
         self.break_particles = [p for p in self.break_particles if p["life"] > 0.0]
 
-    def spawn_explosion_effect(self, center: Vec3f, scale: float = 1.0, axis: Optional[Vec3i] = None) -> None:
+    def spawn_explosion_effect(self, center: Vec3f, scale: float = 1.0, axis: Optional[Vec3i] = None, player_idx: Optional[int] = None) -> None:
         core_count = max(10, int(EXPLOSION_PARTICLE_COUNT * scale))
         spark_count = max(4, int(EXPLOSION_SPARK_COUNT * scale))
         axis_dir = None
@@ -1009,6 +1501,7 @@ class Game:
                     "r": col[0],
                     "g": col[1],
                     "b": col[2],
+                    "owner": -1 if player_idx is None else player_idx,
                 }
             )
         # Fast bright sparks.
@@ -1044,9 +1537,14 @@ class Game:
                     "g": 0.36,
                     "b": 0.10,
                     "spark": 1.0,
+                    "owner": -1 if player_idx is None else player_idx,
                 }
             )
-        self.break_pulse = max(self.break_pulse, 1.4 + 0.8 * scale)
+        if player_idx is None:
+            for p in self.players:
+                p.break_pulse = max(p.break_pulse, 1.4 + 0.8 * scale)
+        elif 0 <= player_idx < len(self.players):
+            self.players[player_idx].break_pulse = max(self.players[player_idx].break_pulse, 1.4 + 0.8 * scale)
 
     def update_explosion_effects(self, dt: float) -> None:
         if not self.explosion_particles:
@@ -1070,44 +1568,67 @@ class Game:
 
         self.explosion_particles = [p for p in self.explosion_particles if p["life"] > 0.0]
 
-    def update_mining(self, dt: float, is_mining: bool) -> None:
+    def update_xray_beams(self, dt: float) -> None:
+        if not self.xray_beams:
+            return
+        for beam in self.xray_beams:
+            beam["life"] = float(beam.get("life", 0.0)) - dt
+        self.xray_beams = [b for b in self.xray_beams if float(b.get("life", 0.0)) > 0.0]
+
+    def update_mining(self, player_idx: int, dt: float, is_mining: bool) -> None:
+        p = self.players[player_idx]
+        if not self.player_alive(player_idx):
+            p.mining_target = None
+            p.mining_progress = 0.0
+            return
         if not is_mining:
-            self.mining_target = None
-            self.mining_progress = 0.0
+            p.mining_target = None
+            p.mining_progress = 0.0
             return
 
-        hit, _ = self.raycast_block(REACH)
+        hit, _ = self.raycast_block(REACH, player_idx)
         if hit is None:
-            self.mining_target = None
-            self.mining_progress = 0.0
+            p.mining_target = None
+            p.mining_progress = 0.0
             return
 
-        if hit != self.mining_target:
-            self.mining_target = hit
-            self.mining_progress = 0.0
+        if hit != p.mining_target:
+            p.mining_target = hit
+            p.mining_progress = 0.0
 
         block = self.world.block_at(*hit)
         if block == AIR:
-            self.mining_target = None
-            self.mining_progress = 0.0
+            p.mining_target = None
+            p.mining_progress = 0.0
             return
 
-        self.mining_progress += dt
-        if self.mining_progress >= self.mine_time_for(block):
+        p.mining_progress += dt
+        if p.mining_progress >= self.mine_time_for(block):
             broken_block = block
             self.set_world_block(*hit, AIR)
-            self.spawn_break_feedback(hit, broken_block)
-            self.mining_target = None
-            self.mining_progress = 0.0
+            self.spawn_break_feedback(hit, broken_block, player_idx)
+            p.mining_target = None
+            p.mining_progress = 0.0
 
-    def player_intersects(self, bx: int, by: int, bz: int) -> bool:
-        pos = self.player_pos()
+    def player_intersects(self, player_idx: int, bx: int, by: int, bz: int) -> bool:
+        pos = self.player_pos(player_idx)
         up = self.outward_up(pos)
         lower = v_add(pos, v_scale(up, PLAYER_BODY_LOWER))
         upper = v_add(pos, v_scale(up, PLAYER_BODY_UPPER))
         return (
             self.sphere_aabb_intersect(lower, PLAYER_RADIUS * 1.05, bx, by, bz)
             or self.sphere_aabb_intersect(upper, PLAYER_RADIUS * PLAYER_HEAD_RADIUS_SCALE, bx, by, bz)
+        )
+
+    def player_in_blast_cell(self, player_idx: int, bx: int, by: int, bz: int) -> bool:
+        # Slightly expanded blast check so close-proximity self-hits are reliable.
+        pos = self.player_pos(player_idx)
+        up = self.player_up(player_idx, pos)
+        lower = v_add(pos, v_scale(up, PLAYER_BODY_LOWER))
+        upper = v_add(pos, v_scale(up, PLAYER_BODY_UPPER))
+        return (
+            self.sphere_aabb_intersect(lower, PLAYER_RADIUS * 1.35, bx, by, bz)
+            or self.sphere_aabb_intersect(upper, PLAYER_RADIUS * 1.22, bx, by, bz)
         )
 
     def sphere_aabb_intersect(self, pos: Vec3f, radius: float, bx: int, by: int, bz: int) -> bool:
@@ -1145,9 +1666,9 @@ class Game:
             or self.collides_sphere(upper, PLAYER_RADIUS * PLAYER_HEAD_RADIUS_SCALE)
         )
 
-    def move_and_collide(self, delta: Vec3f) -> None:
-        pos = self.player_pos()
-        vel = list(self.player_vel())
+    def move_and_collide(self, player_idx: int, delta: Vec3f) -> None:
+        pos = self.player_pos(player_idx)
+        vel = list(self.player_vel(player_idx))
 
         for axis in range(3):
             step = [0.0, 0.0, 0.0]
@@ -1158,12 +1679,12 @@ class Game:
             else:
                 vel[axis] = 0.0
 
-        self.set_player_pos(pos)
-        self.set_player_vel((vel[0], vel[1], vel[2]))
+        self.set_player_pos(player_idx, pos)
+        self.set_player_vel(player_idx, (vel[0], vel[1], vel[2]))
 
-    def raycast_block(self, max_dist: float) -> Tuple[Optional[Vec3i], Optional[Vec3i]]:
-        ox, oy, oz = self.eye_pos()
-        dx, dy, dz = self.look_dir()
+    def raycast_block(self, max_dist: float, player_idx: int) -> Tuple[Optional[Vec3i], Optional[Vec3i]]:
+        ox, oy, oz = self.eye_pos(player_idx)
+        dx, dy, dz = self.look_dir(player_idx)
         last_empty = None
         t = 0.0
         step = 0.05
@@ -1178,28 +1699,66 @@ class Game:
             t += step
         return None, last_empty
 
-    def find_spawn_point(self) -> Vec3f:
-        x = self.world.cx
-        z = self.world.cz
-        top = self.world.find_surface_y(x, z)
-        if top is None:
-            return (self.world.cx + 0.5, self.world.cy + CUBE_HALF + 6.0, self.world.cz + 0.5)
-        return (x + 0.5, top + 1.5, z + 0.5)
+    def random_face_support(self, axis: int, sign: int) -> Optional[Vec3i]:
+        center = [self.world.cx, self.world.cy, self.world.cz]
+        axis_lo = center[axis] - (CUBE_HALF + FACE_RELIEF + 2)
+        axis_hi = center[axis] + (CUBE_HALF + FACE_RELIEF + 2)
+        outer = clamp(center[axis] + sign * (CUBE_HALF + FACE_RELIEF + 1), axis_lo, axis_hi)
+        outer_i = int(round(outer))
+        other_axes = [0, 1, 2]
+        other_axes.remove(axis)
+        ranges = [
+            (max(1, center[other_axes[0]] - CUBE_HALF), min((WORLD_X if other_axes[0] == 0 else WORLD_Y if other_axes[0] == 1 else WORLD_Z) - 2, center[other_axes[0]] + CUBE_HALF)),
+            (max(1, center[other_axes[1]] - CUBE_HALF), min((WORLD_X if other_axes[1] == 0 else WORLD_Y if other_axes[1] == 1 else WORLD_Z) - 2, center[other_axes[1]] + CUBE_HALF)),
+        ]
+        max_steps = CUBE_HALF * 2 + FACE_RELIEF * 2 + 6
 
-    def stabilize_player_spawn(self) -> None:
+        for _ in range(120):
+            a = random.randint(ranges[0][0], ranges[0][1])
+            b = random.randint(ranges[1][0], ranges[1][1])
+            coords = [0, 0, 0]
+            coords[other_axes[0]] = a
+            coords[other_axes[1]] = b
+            for step in range(max_steps):
+                coords[axis] = outer_i - sign * step
+                x, y, z = coords[0], coords[1], coords[2]
+                if not self.world.in_bounds(x, y, z):
+                    continue
+                if self.world.block_at(x, y, z) != AIR:
+                    return (x, y, z)
+        return None
+
+    def find_spawn_point(self, axis: int, sign: int) -> Vec3f:
+        support = self.random_face_support(axis, sign)
+        n = (sign if axis == 0 else 0, sign if axis == 1 else 0, sign if axis == 2 else 0)
+        if support is not None:
+            return (
+                support[0] + 0.5 + n[0] * 1.05,
+                support[1] + 0.5 + n[1] * 1.05,
+                support[2] + 0.5 + n[2] * 1.05,
+            )
+
+        # Deterministic fallback near the requested face center.
+        return (
+            self.world.cx + n[0] * (CUBE_HALF + FACE_RELIEF + 3.0),
+            self.world.cy + n[1] * (CUBE_HALF + FACE_RELIEF + 3.0),
+            self.world.cz + n[2] * (CUBE_HALF + FACE_RELIEF + 3.0),
+        )
+
+    def stabilize_player_spawn(self, player_idx: int) -> None:
         # Resolve any tiny initial overlap with terrain so movement works immediately.
         for _ in range(40):
-            pos = self.player_pos()
+            pos = self.player_pos(player_idx)
             if not self.collides_body(pos):
                 break
             up = self.outward_up(pos)
-            self.set_player_pos(v_add(pos, v_scale(up, 0.08)))
+            self.set_player_pos(player_idx, v_add(pos, v_scale(up, 0.08)))
 
-        pos = self.player_pos()
-        self.player.on_ground = self.collides_body(v_add(pos, v_scale(self.gravity_dir(pos), 0.10)))
+        pos = self.player_pos(player_idx)
+        self.players[player_idx].on_ground = self.collides_body(v_add(pos, v_scale(self.gravity_dir(pos), 0.10)))
 
-    def render_world(self) -> None:
-        px, pz = self.player.x, self.player.z
+    def render_world(self, player_idx: int) -> None:
+        px, _, pz = self.player_pos(player_idx)
         r2 = RENDER_DISTANCE * RENDER_DISTANCE
 
         stride = 44
@@ -1234,25 +1793,60 @@ class Game:
         glDisableClientState(GL_NORMAL_ARRAY)
         glDisableClientState(GL_VERTEX_ARRAY)
 
-        self.render_mines()
-        self.render_break_particles()
-        self.render_explosion_particles()
+        self.render_mines(player_idx)
+        self.render_xray_beams()
+        self.render_break_particles(player_idx)
+        self.render_explosion_particles(player_idx)
 
-    def render_mines(self) -> None:
+    def render_xray_beams(self) -> None:
+        if not self.xray_beams:
+            return
+        was_blend = glIsEnabled(GL_BLEND)
+        glDisable(GL_TEXTURE_2D)
+        glDisable(GL_LIGHTING)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        glLineWidth(5.0)
+        glBegin(GL_LINES)
+        for beam in self.xray_beams:
+            life = float(beam.get("life", 0.0))
+            ttl = max(1e-5, float(beam.get("ttl", XRAY_BEAM_DURATION)))
+            a = clamp(life / ttl, 0.0, 1.0)
+            segs = beam.get("segments")
+            if not isinstance(segs, list):
+                continue
+            for seg in segs:
+                if not isinstance(seg, tuple) or len(seg) != 2:
+                    continue
+                p0, p1 = seg
+                if not isinstance(p0, tuple) or not isinstance(p1, tuple):
+                    continue
+                glColor4f(0.62, 1.0, 0.22, 0.22 * a)
+                glVertex3f(p0[0], p0[1], p0[2])
+                glVertex3f(p1[0], p1[1], p1[2])
+                glColor4f(0.94, 1.0, 0.40, 0.85 * a)
+                glVertex3f(p0[0], p0[1], p0[2])
+                glVertex3f(p1[0], p1[1], p1[2])
+        glEnd()
+        glLineWidth(1.0)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        if not was_blend:
+            glDisable(GL_BLEND)
+        glEnable(GL_LIGHTING)
+        glEnable(GL_TEXTURE_2D)
+
+    def render_mines(self, player_idx: int) -> None:
         if not self.mines:
             return
 
-        was_blend = glIsEnabled(GL_BLEND)
-        glDisable(GL_TEXTURE_2D)
-        glDisable(GL_BLEND)
-        glDisable(GL_CULL_FACE)
-        glEnable(GL_LIGHTING)
+        cam = self.player_pos(player_idx)
+        max_r2 = MINE_RENDER_DISTANCE * MINE_RENDER_DISTANCE
+        visible: List[Tuple[Dict[str, object], Vec3f, Vec3f, Vec3f, Vec3f, float]] = []
 
         for mine in self.mines.values():
             pos = mine.get("pos")
             normal = mine.get("normal")
             support = mine.get("support")
-            timer = float(mine.get("timer", 0.0))
             if not isinstance(pos, tuple) or not isinstance(normal, tuple) or not isinstance(support, tuple):
                 continue
 
@@ -1260,26 +1854,45 @@ class Game:
             if v_len(n) < 1e-6:
                 continue
 
-            # Build tangent basis from mine normal.
+            support_center = (support[0] + 0.5, support[1] + 0.5, support[2] + 0.5)
+            center = v_add(support_center, v_scale(n, 0.5 + 0.22 * 0.72))
+            d2 = (center[0] - cam[0]) ** 2 + (center[1] - cam[1]) ** 2 + (center[2] - cam[2]) ** 2
+            if d2 > max_r2:
+                continue
+
             ref = (0.0, 1.0, 0.0) if abs(n[1]) < 0.9 else (1.0, 0.0, 0.0)
             u = v_norm(v_cross(ref, n))
             v = v_norm(v_cross(n, u))
+            visible.append((mine, center, n, u, v, d2))
+
+        if not visible:
+            return
+
+        was_blend = glIsEnabled(GL_BLEND)
+        glDisable(GL_TEXTURE_2D)
+        glDisable(GL_BLEND)
+        glDisable(GL_CULL_FACE)
+        glEnable(GL_LIGHTING)
+        t_now = pygame.time.get_ticks() * 0.001
+
+        # Opaque mine bodies.
+        for mine, center, n, u, v, _ in visible:
+            kind = str(mine.get("kind", "timed"))
+            timer = float(mine.get("timer", 0.0))
 
             r = 0.22
-            # Position: sit flush on the support face with a tiny outward offset.
-            support_center = (support[0] + 0.5, support[1] + 0.5, support[2] + 0.5)
-            center = v_add(support_center, v_scale(n, 0.5 + r * 0.72))
 
             # Closed low-poly sphere body (round mine, fully opaque).
-            stacks = 7
-            slices = 14
-            glColor3f(0.015, 0.012, 0.01)
-            for i in range(stacks):
-                t0 = math.pi * i / stacks
-                t1 = math.pi * (i + 1) / stacks
+            if kind == "xray":
+                glColor3f(0.10, 0.12, 0.03)
+            else:
+                glColor3f(0.015, 0.012, 0.01)
+            for i in range(MINE_SPHERE_STACKS):
+                t0 = math.pi * i / MINE_SPHERE_STACKS
+                t1 = math.pi * (i + 1) / MINE_SPHERE_STACKS
                 glBegin(GL_TRIANGLE_STRIP)
-                for j in range(slices + 1):
-                    p = 2.0 * math.pi * j / slices
+                for j in range(MINE_SPHERE_SLICES + 1):
+                    p = 2.0 * math.pi * j / MINE_SPHERE_SLICES
                     for t in (t0, t1):
                         st = math.sin(t)
                         ct = math.cos(t)
@@ -1291,12 +1904,20 @@ class Game:
                         glVertex3f(point[0], point[1], point[2])
                 glEnd()
 
-            # Flashing red indicator on top.
-            elapsed = MINE_FUSE_SECONDS - timer
-            flash = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(elapsed * 11.0))
+            # Flashing indicator on top.
+            if kind == "xray":
+                elapsed = pygame.time.get_ticks() * 0.001
+                flash = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(elapsed * 8.5))
+            else:
+                elapsed = MINE_FUSE_SECONDS - timer
+                flash = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(elapsed * 11.0))
             glDisable(GL_LIGHTING)
-            glColor4f(0.82 * flash, 0.07 * flash, 0.03 * flash, 1.0)
-            led_r = 0.08
+            if kind == "xray":
+                glColor4f(0.80 * flash, 1.0 * flash, 0.16 * flash, 1.0)
+                led_r = 0.10
+            else:
+                glColor4f(0.82 * flash, 0.07 * flash, 0.03 * flash, 1.0)
+                led_r = 0.08
             led_center = v_add(center, v_scale(n, r + 0.004))
             glBegin(GL_TRIANGLE_FAN)
             glVertex3f(led_center[0], led_center[1], led_center[2])
@@ -1314,7 +1935,7 @@ class Game:
             glEnable(GL_BLEND)
         glEnable(GL_TEXTURE_2D)
 
-    def render_break_particles(self) -> None:
+    def render_break_particles(self, player_idx: int) -> None:
         if not self.break_particles:
             return
 
@@ -1324,6 +1945,9 @@ class Game:
         glPointSize(5.0)
         glBegin(GL_POINTS)
         for p in self.break_particles:
+            owner = int(p.get("owner", -1))
+            if owner >= 0 and owner != player_idx:
+                continue
             if p["d"] > 0.5:
                 continue
             alpha = clamp(p["life"] / p["ttl"], 0.0, 1.0)
@@ -1334,6 +1958,9 @@ class Game:
         glPointSize(7.0)
         glBegin(GL_POINTS)
         for p in self.break_particles:
+            owner = int(p.get("owner", -1))
+            if owner >= 0 and owner != player_idx:
+                continue
             if p["d"] <= 0.5:
                 continue
             alpha = clamp(p["life"] / p["ttl"], 0.0, 1.0)
@@ -1344,7 +1971,7 @@ class Game:
         glEnable(GL_TEXTURE_2D)
         glEnable(GL_LIGHTING)
 
-    def render_explosion_particles(self) -> None:
+    def render_explosion_particles(self, player_idx: int) -> None:
         if not self.explosion_particles:
             return
 
@@ -1354,6 +1981,9 @@ class Game:
         glPointSize(16.0)
         glBegin(GL_POINTS)
         for p in self.explosion_particles:
+            owner = int(p.get("owner", -1))
+            if owner >= 0 and owner != player_idx:
+                continue
             alpha = clamp(p["life"] / p["ttl"], 0.0, 1.0)
             spark = float(p.get("spark", 0.0))
             glow = 1.1 if spark > 0.5 else 0.95
@@ -1368,15 +1998,16 @@ class Game:
         glEnable(GL_TEXTURE_2D)
         glEnable(GL_LIGHTING)
 
-    def update_lantern_light(self) -> None:
-        ex, ey, ez = self.eye_pos()
+    def update_lantern_light(self, player_idx: int) -> None:
+        ex, ey, ez = self.eye_pos(player_idx)
         glLightfv(GL_LIGHT0, GL_POSITION, (ex, ey, ez, 1.0))
 
-    def render_crosshair(self) -> None:
+    def render_crosshair(self, player_idx: int, view_w: int, view_h: int) -> None:
+        p = self.players[player_idx]
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
         glLoadIdentity()
-        glOrtho(0, self.width, self.height, 0, -1, 1)
+        glOrtho(0, view_w, view_h, 0, -1, 1)
 
         glMatrixMode(GL_MODELVIEW)
         glPushMatrix()
@@ -1386,9 +2017,9 @@ class Game:
         glDisable(GL_TEXTURE_2D)
         glDisable(GL_DEPTH_TEST)
         glColor3f(1.0, 1.0, 1.0)
-        cx = self.width // 2
-        cy = self.height // 2
-        size = 8.0 + self.break_pulse * 5.0
+        cx = view_w // 2
+        cy = view_h // 2
+        size = 8.0 + p.break_pulse * 5.0
         glBegin(GL_LINES)
         glVertex2f(cx - size, cy)
         glVertex2f(cx + size, cy)
@@ -1397,12 +2028,12 @@ class Game:
         glEnd()
 
         # Mining progress line under reticle.
-        if self.mining_target is not None:
-            target_block = self.world.block_at(*self.mining_target)
+        if p.mining_target is not None:
+            target_block = self.world.block_at(*p.mining_target)
             if target_block != AIR:
                 req = self.mine_time_for(target_block)
                 if req > 0.0:
-                    progress = clamp(self.mining_progress / req, 0.0, 1.0)
+                    progress = clamp(p.mining_progress / req, 0.0, 1.0)
                     bar_w = 44.0
                     y = cy + 18.0
                     glColor3f(0.25, 0.23, 0.2)
@@ -1416,6 +2047,10 @@ class Game:
                     glVertex2f(cx - bar_w * 0.5 + bar_w * progress, y)
                     glEnd()
 
+        self.render_horizon_marker(player_idx, view_w, view_h)
+        self.render_health_bar(player_idx, view_w, view_h)
+        self.render_other_player_dot(player_idx, view_w, view_h)
+
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_TEXTURE_2D)
         glEnable(GL_LIGHTING)
@@ -1424,13 +2059,447 @@ class Game:
         glPopMatrix()
         glMatrixMode(GL_MODELVIEW)
 
-    def apply_camera(self) -> None:
+    def render_horizon_marker(self, player_idx: int, view_w: int, view_h: int) -> None:
+        pos = self.player_pos(player_idx)
+        fwd = self.look_dir(player_idx)
+        up = self.player_up(player_idx, pos)
+        right = v_norm(v_cross(fwd, up))
+        if v_len(right) < 1e-5:
+            right = (1.0, 0.0, 0.0)
+
+        # Project global up into camera plane so marker changes across cube faces.
+        global_up = (0.0, 1.0, 0.0)
+        h = v_sub(global_up, v_scale(fwd, v_dot(global_up, fwd)))
+        if v_len(h) < 1e-5:
+            h = right
+        h = v_norm(h)
+        hx = v_dot(h, right)
+        hy = v_dot(h, up)
+        h2 = math.sqrt(hx * hx + hy * hy)
+        if h2 < 1e-5:
+            hx, hy = 1.0, 0.0
+        else:
+            hx /= h2
+            hy /= h2
+
+        cx = view_w * 0.5
+        cy = view_h * 0.5
+        line_len = 24.0
+        tick = 6.0
+
+        glLineWidth(3.0)
+        glColor3f(1.0, 0.95, 0.18)
+        glBegin(GL_LINES)
+        glVertex2f(cx - hx * line_len, cy + hy * line_len)
+        glVertex2f(cx + hx * line_len, cy - hy * line_len)
+        # center tick normal to the horizon line
+        glVertex2f(cx - hy * tick, cy - hx * tick)
+        glVertex2f(cx + hy * tick, cy + hx * tick)
+        glEnd()
+        glLineWidth(1.0)
+
+    def render_health_bar(self, player_idx: int, view_w: int, view_h: int) -> None:
+        p = self.players[player_idx]
+        pct = clamp(p.health / PLAYER_MAX_HEALTH, 0.0, 1.0)
+        w = min(260.0, view_w * 0.50)
+        h = 20.0
+        margin = 14.0
+        x = view_w - w - margin
+        y = view_h - h - margin
+        was_blend = glIsEnabled(GL_BLEND)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        glColor4f(0.0, 0.0, 0.0, 0.62)
+        glBegin(GL_QUADS)
+        glVertex2f(x - 4.0, y - 4.0)
+        glVertex2f(x + w + 4.0, y - 4.0)
+        glVertex2f(x + w + 4.0, y + h + 4.0)
+        glVertex2f(x - 4.0, y + h + 4.0)
+        glEnd()
+
+        glColor3f(0.10, 0.08, 0.03)
+        glBegin(GL_QUADS)
+        glVertex2f(x, y)
+        glVertex2f(x + w, y)
+        glVertex2f(x + w, y + h)
+        glVertex2f(x, y + h)
+        glEnd()
+
+        # Health starts fully yellow and contracts as damage is taken.
+        glColor3f(1.0, 0.93, 0.20)
+        glBegin(GL_QUADS)
+        glVertex2f(x, y)
+        glVertex2f(x + w, y)
+        glVertex2f(x + w, y + h)
+        glVertex2f(x, y + h)
+        glEnd()
+
+        if pct < 1.0:
+            missing_x = x + w * pct
+            glColor3f(0.10, 0.08, 0.03)
+            glBegin(GL_QUADS)
+            glVertex2f(missing_x, y)
+            glVertex2f(x + w, y)
+            glVertex2f(x + w, y + h)
+            glVertex2f(missing_x, y + h)
+            glEnd()
+
+        # Bright border to ensure visibility in dark scenes.
+        glLineWidth(2.5)
+        glColor3f(1.0, 0.95, 0.34)
+        glBegin(GL_LINE_LOOP)
+        glVertex2f(x - 1.5, y - 1.5)
+        glVertex2f(x + w + 1.5, y - 1.5)
+        glVertex2f(x + w + 1.5, y + h + 1.5)
+        glVertex2f(x - 1.5, y + h + 1.5)
+        glEnd()
+        glLineWidth(1.0)
+
+        # Center notch marker.
+        mx = x + w * 0.5
+        glColor3f(0.32, 0.24, 0.06)
+        glBegin(GL_LINES)
+        glVertex2f(mx, y)
+        glVertex2f(mx, y + h)
+        glEnd()
+        if not was_blend:
+            glDisable(GL_BLEND)
+
+    def render_death_overlay(self, player_idx: int, view_w: int, view_h: int) -> None:
+        alpha = self.death_overlay_alpha(player_idx)
+        if alpha <= 0.0:
+            return
+
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
         glLoadIdentity()
-        eye = self.eye_pos()
-        look = self.look_dir()
-        up = self.outward_up(self.player_pos())
+        glOrtho(0, view_w, view_h, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+        was_blend = glIsEnabled(GL_BLEND)
+        if alpha >= 0.999:
+            glDisable(GL_BLEND)
+        else:
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDisable(GL_LIGHTING)
+        glDisable(GL_TEXTURE_2D)
+        glDisable(GL_DEPTH_TEST)
+        glColor4f(0.0, 0.0, 0.0, alpha)
+        glBegin(GL_QUADS)
+        glVertex2f(0.0, 0.0)
+        glVertex2f(float(view_w), 0.0)
+        glVertex2f(float(view_w), float(view_h))
+        glVertex2f(0.0, float(view_h))
+        glEnd()
+        if was_blend:
+            glEnable(GL_BLEND)
+        else:
+            glDisable(GL_BLEND)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_TEXTURE_2D)
+        glEnable(GL_LIGHTING)
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
+
+    def death_overlay_alpha(self, player_idx: int) -> float:
+        p = self.players[player_idx]
+        if self.player_alive(player_idx):
+            return 0.0
+        if p.death_fade_timer > 0.0:
+            fade_t = 1.0 - clamp(p.death_fade_timer / max(1e-5, DEATH_FADE_SECONDS), 0.0, 1.0)
+            # Strongly visible fade from frame one, then up to full black.
+            return clamp(0.35 + 0.65 * fade_t, 0.0, 1.0)
+        return 1.0
+
+    def apply_camera(self, player_idx: int) -> None:
+        glLoadIdentity()
+        eye = self.eye_pos(player_idx)
+        look = self.look_dir(player_idx)
+        up = self.player_up(player_idx)
         target = v_add(eye, look)
         gluLookAt(eye[0], eye[1], eye[2], target[0], target[1], target[2], up[0], up[1], up[2])
+
+    def render_other_player_dot(self, player_idx: int, view_w: int, view_h: int) -> None:
+        other_idx = 1 - player_idx
+        eye = self.eye_pos(player_idx)
+        target = self.player_pos(other_idx)
+        rel = v_sub(target, eye)
+
+        fwd = self.look_dir(player_idx)
+        up = self.player_up(player_idx)
+        right = v_norm(v_cross(fwd, up))
+        if v_len(right) < 1e-5:
+            right = (1.0, 0.0, 0.0)
+        up = v_norm(v_cross(right, fwd))
+        z = v_dot(rel, fwd)
+        x = v_dot(rel, right)
+        y = v_dot(rel, up)
+
+        tan_half = math.tan(math.radians(FOV_DEG * 0.5))
+        aspect = view_w / max(1.0, float(view_h))
+
+        behind = z <= 0.01
+        if behind:
+            z = 0.01
+            x = -x
+            y = -y
+
+        x_ndc = x / (z * tan_half * aspect)
+        y_ndc = y / (z * tan_half)
+        offscreen = behind or abs(x_ndc) > 1.0 or abs(y_ndc) > 1.0
+
+        x_ndc = clamp(x_ndc, -0.92, 0.92)
+        y_ndc = clamp(y_ndc, -0.92, 0.92)
+        sx = (x_ndc * 0.5 + 0.5) * view_w
+        sy = (-y_ndc * 0.5 + 0.5) * view_h
+
+        t = pygame.time.get_ticks() * 0.001
+        pulse = 0.65 + 0.35 * (0.5 + 0.5 * math.sin(t * 9.0))
+        cx = view_w * 0.5
+        cy = view_h * 0.5
+
+        if offscreen:
+            fill = (1.0, 0.12, 0.08)
+            ring = (1.0, 0.78, 0.25)
+            radius = 18.0
+        else:
+            fill = (0.95, 1.0, 0.12)
+            ring = (0.15, 1.0, 0.35)
+            radius = 15.0
+
+        # Dotted, semi-transparent direction line (visible only while '.' is held).
+        if self.show_player_lines:
+            glLineWidth(3.5)
+            glColor4f(ring[0] * 0.9, ring[1] * 0.9, ring[2] * 0.5, 0.5)
+            dx = sx - cx
+            dy = sy - cy
+            seg_len = math.sqrt(dx * dx + dy * dy)
+            if seg_len > 1e-4:
+                ux = dx / seg_len
+                uy = dy / seg_len
+                dash = 14.0
+                gap = 10.0
+                tpos = 0.0
+                glBegin(GL_LINES)
+                while tpos < seg_len:
+                    a = tpos
+                    b = min(seg_len, tpos + dash)
+                    glVertex2f(cx + ux * a, cy + uy * a)
+                    glVertex2f(cx + ux * b, cy + uy * b)
+                    tpos += dash + gap
+                glEnd()
+
+        # Pulsing outer ring.
+        glColor3f(ring[0] * pulse, ring[1] * pulse, ring[2] * pulse)
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex2f(sx, sy)
+        for i in range(25):
+            a = (math.pi * 2.0 * i) / 24.0
+            glVertex2f(sx + math.cos(a) * (radius + 10.0 * pulse), sy + math.sin(a) * (radius + 10.0 * pulse))
+        glEnd()
+
+        # Bold black stroke.
+        glColor3f(0.0, 0.0, 0.0)
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex2f(sx, sy)
+        for i in range(25):
+            a = (math.pi * 2.0 * i) / 24.0
+            glVertex2f(sx + math.cos(a) * (radius + 4.0), sy + math.sin(a) * (radius + 4.0))
+        glEnd()
+
+        # Main fill.
+        glColor3f(fill[0], fill[1], fill[2])
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex2f(sx, sy)
+        for i in range(25):
+            a = (math.pi * 2.0 * i) / 24.0
+            glVertex2f(sx + math.cos(a) * radius, sy + math.sin(a) * radius)
+        glEnd()
+
+        # Bright center.
+        glColor3f(1.0, 1.0, 1.0)
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex2f(sx, sy)
+        for i in range(25):
+            a = (math.pi * 2.0 * i) / 24.0
+            glVertex2f(sx + math.cos(a) * (radius * 0.32), sy + math.sin(a) * (radius * 0.32))
+        glEnd()
+
+        self.render_player_radar(player_idx, view_w, view_h)
+
+    def render_player_radar(self, player_idx: int, view_w: int, view_h: int) -> None:
+        other_idx = 1 - player_idx
+        center_x = 70.0
+        center_y = 70.0
+        radar_r = 46.0
+        max_range = 42.0
+
+        pos = self.player_pos(player_idx)
+        other = self.player_pos(other_idx)
+        rel = v_sub(other, pos)
+        fwd, right, _ = self.camera_basis(player_idx, pos)
+        rx = v_dot(rel, right)
+        rz = v_dot(rel, fwd)
+
+        # Radar frame.
+        glColor4f(0.0, 0.0, 0.0, 0.45)
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex2f(center_x, center_y)
+        for i in range(33):
+            a = (math.pi * 2.0 * i) / 32.0
+            glVertex2f(center_x + math.cos(a) * radar_r, center_y + math.sin(a) * radar_r)
+        glEnd()
+
+        glColor3f(0.92, 0.96, 0.22)
+        glLineWidth(2.0)
+        glBegin(GL_LINE_LOOP)
+        for i in range(33):
+            a = (math.pi * 2.0 * i) / 32.0
+            glVertex2f(center_x + math.cos(a) * radar_r, center_y + math.sin(a) * radar_r)
+        glEnd()
+
+        glColor4f(0.9, 0.9, 0.2, 0.35)
+        glBegin(GL_LINES)
+        glVertex2f(center_x - radar_r, center_y)
+        glVertex2f(center_x + radar_r, center_y)
+        glVertex2f(center_x, center_y - radar_r)
+        glVertex2f(center_x, center_y + radar_r)
+        glEnd()
+
+        # Other-player blip.
+        scale = radar_r / max_range
+        bx = clamp(rx * scale, -radar_r + 4.0, radar_r - 4.0)
+        by = clamp(-rz * scale, -radar_r + 4.0, radar_r - 4.0)
+        dist = math.sqrt(rx * rx + rz * rz)
+        pulse = 0.6 + 0.4 * (0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.012))
+        if dist > max_range:
+            color = (1.0, 0.28, 0.16)
+        else:
+            color = (0.25, 1.0, 0.28)
+        glColor3f(color[0] * pulse, color[1] * pulse, color[2] * pulse)
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex2f(center_x + bx, center_y + by)
+        for i in range(17):
+            a = (math.pi * 2.0 * i) / 16.0
+            glVertex2f(center_x + bx + math.cos(a) * 5.0, center_y + by + math.sin(a) * 5.0)
+        glEnd()
+
+        # Show the other player's facing direction on radar.
+        other_fwd = self.look_dir(other_idx)
+        hx = v_dot(other_fwd, right)
+        hz = v_dot(other_fwd, fwd)
+        hlen = math.sqrt(hx * hx + hz * hz)
+        if hlen > 1e-5:
+            hx /= hlen
+            hz /= hlen
+            tip_x = center_x + bx + hx * 10.0
+            tip_y = center_y + by - hz * 10.0
+            left_x = center_x + bx - hz * 3.5
+            left_y = center_y + by - hx * 3.5
+            right_x = center_x + bx + hz * 3.5
+            right_y = center_y + by + hx * 3.5
+            # Dark outline under bright arrow for contrast.
+            glColor3f(0.05, 0.05, 0.05)
+            glBegin(GL_TRIANGLES)
+            glVertex2f(tip_x + hx * 1.4, tip_y - hz * 1.4)
+            glVertex2f(left_x - hz * 1.3, left_y - hx * 1.3)
+            glVertex2f(right_x + hz * 1.3, right_y + hx * 1.3)
+            glEnd()
+            glColor3f(1.0, 0.98, 0.16)
+            glBegin(GL_TRIANGLES)
+            glVertex2f(tip_x, tip_y)
+            glVertex2f(left_x, left_y)
+            glVertex2f(right_x, right_y)
+            glEnd()
+
+        self.render_face_indicator(player_idx, center_x + 92.0, center_y)
+
+    def render_face_indicator(self, player_idx: int, cx: float, cy: float) -> None:
+        face = self.face_for_position(self.player_pos(player_idx))
+        tile = 15.0
+        t = pygame.time.get_ticks() * 0.001
+        pulse = 0.65 + 0.35 * (0.5 + 0.5 * math.sin(t * 7.0))
+
+        # Compact unfolded-cube map around +Z (front) face.
+        layout: List[Tuple[Tuple[int, int], Tuple[int, int]]] = [
+            ((0, 1), (-1, 0)),   # -X
+            ((0, -1), (1, 0)),   # +X
+            ((1, 1), (0, -1)),   # +Y
+            ((1, -1), (0, 1)),   # -Y
+            ((2, 1), (0, 0)),    # +Z
+            ((2, -1), (2, 0)),   # -Z
+        ]
+
+        panel_w = tile * 5.2
+        panel_h = tile * 3.9
+        glColor4f(0.12, 0.10, 0.02, 0.35)
+        glBegin(GL_QUADS)
+        glVertex2f(cx - panel_w * 0.5, cy - panel_h * 0.5)
+        glVertex2f(cx + panel_w * 0.5, cy - panel_h * 0.5)
+        glVertex2f(cx + panel_w * 0.5, cy + panel_h * 0.5)
+        glVertex2f(cx - panel_w * 0.5, cy + panel_h * 0.5)
+        glEnd()
+
+        for f, (gx, gy) in layout:
+            x0 = cx + gx * tile - tile * 0.46
+            y0 = cy + gy * tile - tile * 0.46
+            x1 = x0 + tile * 0.92
+            y1 = y0 + tile * 0.92
+
+            # Base cube representation is yellow for all faces.
+            glColor3f(0.98, 0.88, 0.22)
+
+            glBegin(GL_QUADS)
+            glVertex2f(x0, y0)
+            glVertex2f(x1, y0)
+            glVertex2f(x1, y1)
+            glVertex2f(x0, y1)
+            glEnd()
+
+            if f == face:
+                # Active face: darker yellow shade overlay.
+                inset = tile * 0.10
+                glColor3f(0.72, 0.54, 0.05)
+                glBegin(GL_QUADS)
+                glVertex2f(x0 + inset, y0 + inset)
+                glVertex2f(x1 - inset, y0 + inset)
+                glVertex2f(x1 - inset, y1 - inset)
+                glVertex2f(x0 + inset, y1 - inset)
+                glEnd()
+
+                # Bright pulsing center overlay for clarity.
+                inset2 = tile * 0.28
+                glColor3f(1.0, 0.95, 0.24 + 0.22 * pulse)
+                glBegin(GL_QUADS)
+                glVertex2f(x0 + inset2, y0 + inset2)
+                glVertex2f(x1 - inset2, y0 + inset2)
+                glVertex2f(x1 - inset2, y1 - inset2)
+                glVertex2f(x0 + inset2, y1 - inset2)
+                glEnd()
+
+                # Thick active border.
+                glLineWidth(3.0)
+                glColor3f(1.0, 0.95, 0.15)
+                glBegin(GL_LINE_LOOP)
+                glVertex2f(x0 - 1.0, y0 - 1.0)
+                glVertex2f(x1 + 1.0, y0 - 1.0)
+                glVertex2f(x1 + 1.0, y1 + 1.0)
+                glVertex2f(x0 - 1.0, y1 + 1.0)
+                glEnd()
+                glLineWidth(1.0)
+
+            glColor3f(0.42, 0.31, 0.08)
+            glBegin(GL_LINE_LOOP)
+            glVertex2f(x0, y0)
+            glVertex2f(x1, y0)
+            glVertex2f(x1, y1)
+            glVertex2f(x0, y1)
+            glEnd()
 
     def shutdown(self) -> None:
         for mesh in self.chunk_meshes.values():
@@ -1438,20 +2507,106 @@ class Game:
         glDeleteTextures(1, [self.texture_atlas])
         pygame.quit()
 
+    def render_player_view(self, player_idx: int, vx: int, vy: int, vw: int, vh: int) -> None:
+        glViewport(vx, vy, vw, vh)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(FOV_DEG, vw / max(1.0, float(vh)), 0.05, 450.0)
+        glMatrixMode(GL_MODELVIEW)
+        self.apply_camera(player_idx)
+        self.update_lantern_light(player_idx)
+        self.render_world(player_idx)
+        self.render_crosshair(player_idx, vw, vh)
+
+    def render_death_overlays_screen(self, half_w: int) -> None:
+        a0 = self.death_overlay_alpha(0)
+        a1 = self.death_overlay_alpha(1)
+        if a0 <= 0.0 and a1 <= 0.0:
+            return
+
+        was_blend = glIsEnabled(GL_BLEND)
+        was_cull = glIsEnabled(GL_CULL_FACE)
+        glViewport(0, 0, self.width, self.height)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        glOrtho(0, self.width, self.height, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        glDisable(GL_LIGHTING)
+        glDisable(GL_TEXTURE_2D)
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        if a0 > 0.0:
+            glColor4f(0.0, 0.0, 0.0, a0)
+            glBegin(GL_QUADS)
+            glVertex2f(0.0, 0.0)
+            glVertex2f(float(half_w), 0.0)
+            glVertex2f(float(half_w), float(self.height))
+            glVertex2f(0.0, float(self.height))
+            glEnd()
+
+        if a1 > 0.0:
+            glColor4f(0.0, 0.0, 0.0, a1)
+            glBegin(GL_QUADS)
+            glVertex2f(float(half_w), 0.0)
+            glVertex2f(float(self.width), 0.0)
+            glVertex2f(float(self.width), float(self.height))
+            glVertex2f(float(half_w), float(self.height))
+            glEnd()
+
+        if not was_blend:
+            glDisable(GL_BLEND)
+        if was_cull:
+            glEnable(GL_CULL_FACE)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_TEXTURE_2D)
+        glEnable(GL_LIGHTING)
+
     def run(self) -> None:
         while self.running:
             dt = min(self.clock.tick(60) / 1000.0, 0.05)
+            if pygame.mouse.get_visible():
+                pygame.mouse.set_visible(False)
+            pygame.event.set_grab(True)
+            self.update_player_up_smoothing(dt)
             self.process_input(dt)
+            self.update_hazard_damage(dt)
             self.update_mines(dt)
             self.update_break_feedback(dt)
             self.update_explosion_effects(dt)
+            self.update_xray_beams(dt)
+            self.update_respawns(dt)
             self.update_dirty_meshes(per_frame=5)
 
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-            self.apply_camera()
-            self.update_lantern_light()
-            self.render_world()
-            self.render_crosshair()
+            half_w = self.width // 2
+            self.render_player_view(0, 0, 0, half_w, self.height)
+            self.render_player_view(1, half_w, 0, self.width - half_w, self.height)
+            self.render_death_overlays_screen(half_w)
+
+            # Divider between splits.
+            glViewport(0, 0, self.width, self.height)
+            glMatrixMode(GL_PROJECTION)
+            glLoadIdentity()
+            glOrtho(0, self.width, self.height, 0, -1, 1)
+            glMatrixMode(GL_MODELVIEW)
+            glLoadIdentity()
+            glDisable(GL_LIGHTING)
+            glDisable(GL_TEXTURE_2D)
+            glDisable(GL_DEPTH_TEST)
+            glColor3f(0.1, 0.08, 0.08)
+            glBegin(GL_QUADS)
+            glVertex2f(half_w - 1, 0)
+            glVertex2f(half_w + 1, 0)
+            glVertex2f(half_w + 1, self.height)
+            glVertex2f(half_w - 1, self.height)
+            glEnd()
+            glEnable(GL_DEPTH_TEST)
+            glEnable(GL_TEXTURE_2D)
+            glEnable(GL_LIGHTING)
             pygame.display.flip()
 
         self.shutdown()
