@@ -38,9 +38,9 @@ MINE_FUSE_SECONDS = 10.0
 MINE_RENDER_DISTANCE = 42.0
 MINE_SPHERE_STACKS = 4
 MINE_SPHERE_SLICES = 8
-MINE_TIME_DIRT = 0.28
-MINE_TIME_STONE = 0.55
-MINE_TIME_WOOD = 0.42
+MINE_TIME_DIRT = 0.48
+MINE_TIME_STONE = 0.95
+MINE_TIME_WOOD = 0.72
 BREAK_PARTICLE_COUNT = 20
 BREAK_PARTICLE_LIFE = 0.65
 BREAK_PARTICLE_SPEED = 3.6
@@ -69,6 +69,7 @@ XRAY_RAY_RANGE = 14
 XRAY_BEAM_DURATION = 0.55
 DEATH_BLACKOUT_SECONDS = 5.0
 DEATH_FADE_SECONDS = 2.0
+TITLE_MIN_SECONDS = 3.0
 
 CUBE_HALF = 20
 FACE_RELIEF = 10
@@ -375,6 +376,8 @@ class Player:
     jump_buffer_timer: float = 0.0
     jump_was_down: bool = False
     health: float = PLAYER_MAX_HEALTH
+    health_display: float = PLAYER_MAX_HEALTH
+    health_hit_flash: float = 0.0
     up_x: float = 0.0
     up_y: float = 1.0
     up_z: float = 0.0
@@ -442,6 +445,10 @@ class Game:
         self.texture_atlas = self.create_texture_atlas()
 
         self.clock = pygame.time.Clock()
+        self.ui_font = pygame.font.SysFont("Menlo", 18)
+        self.ui_font_small = pygame.font.SysFont("Menlo", 15)
+        self.ui_font_title = pygame.font.SysFont("Georgia", 62, bold=True)
+        self.ui_font_subtitle = pygame.font.SysFont("Georgia", 28, bold=True)
         self.world = World(seed=2106)
         self.world.generate()
 
@@ -464,6 +471,7 @@ class Game:
         self.reset_player_up(0)
         self.reset_player_up(1)
         self.initial_spawn_points: List[Vec3f] = [self.player_pos(0), self.player_pos(1)]
+        self.reset_players_for_match_start()
 
         self.chunk_meshes: Dict[ChunkKey, ChunkMesh] = {}
         self.dirty_chunks: Set[ChunkKey] = set()
@@ -478,9 +486,14 @@ class Game:
         self.gamepads: List[pygame.joystick.Joystick] = []
         self.p1_pad: Optional[pygame.joystick.Joystick] = None
         self.p2_pad: Optional[pygame.joystick.Joystick] = None
+        self.p1_pad_slot: Optional[int] = None
+        self.p2_pad_slot: Optional[int] = None
         self.pad_prev_buttons: List[Dict[int, bool]] = [{}, {}]
         self.refresh_gamepads()
         self.show_player_lines = False
+        self.show_controls_help = False
+        self.in_title_screen = True
+        self.title_screen_started_at = pygame.time.get_ticks() * 0.001
         self.running = True
 
     def refresh_gamepads(self) -> None:
@@ -491,15 +504,92 @@ class Game:
             js.init()
             self.gamepads.append(js)
 
-        if len(self.gamepads) >= 2:
-            self.p1_pad = self.gamepads[0]
-            self.p2_pad = self.gamepads[1]
-        elif len(self.gamepads) == 1:
-            self.p1_pad = None
-            self.p2_pad = self.gamepads[0]
+        max_idx = len(self.gamepads) - 1
+        if self.p1_pad_slot is not None and self.p1_pad_slot > max_idx:
+            self.p1_pad_slot = None
+        if self.p2_pad_slot is not None and self.p2_pad_slot > max_idx:
+            self.p2_pad_slot = None
+
+        if len(self.gamepads) == 0:
+            self.p1_pad_slot = None
+            self.p2_pad_slot = None
+        elif self.p1_pad_slot is None and self.p2_pad_slot is None:
+            self.auto_assign_gamepads()
         else:
-            self.p1_pad = None
-            self.p2_pad = None
+            self.ensure_valid_pad_assignments()
+        self.apply_pad_assignments()
+
+    def auto_assign_gamepads(self) -> None:
+        if len(self.gamepads) >= 2:
+            self.p1_pad_slot = 0
+            self.p2_pad_slot = 1
+        elif len(self.gamepads) == 1:
+            self.p1_pad_slot = None
+            self.p2_pad_slot = 0
+        else:
+            self.p1_pad_slot = None
+            self.p2_pad_slot = None
+
+    def ensure_valid_pad_assignments(self) -> None:
+        if len(self.gamepads) == 0:
+            self.p1_pad_slot = None
+            self.p2_pad_slot = None
+            return
+
+        if self.p1_pad_slot is not None and self.p1_pad_slot >= len(self.gamepads):
+            self.p1_pad_slot = None
+        if self.p2_pad_slot is not None and self.p2_pad_slot >= len(self.gamepads):
+            self.p2_pad_slot = None
+
+        if self.p1_pad_slot is not None and self.p2_pad_slot is not None and self.p1_pad_slot == self.p2_pad_slot:
+            for i in range(len(self.gamepads)):
+                if i != self.p1_pad_slot:
+                    self.p2_pad_slot = i
+                    break
+            else:
+                self.p2_pad_slot = self.p1_pad_slot
+
+        if self.p2_pad_slot is None and len(self.gamepads) > 0:
+            for i in range(len(self.gamepads)):
+                if i != self.p1_pad_slot:
+                    self.p2_pad_slot = i
+                    break
+            else:
+                self.p2_pad_slot = 0
+
+    def apply_pad_assignments(self) -> None:
+        self.p1_pad = self.gamepads[self.p1_pad_slot] if self.p1_pad_slot is not None and self.p1_pad_slot < len(self.gamepads) else None
+        self.p2_pad = self.gamepads[self.p2_pad_slot] if self.p2_pad_slot is not None and self.p2_pad_slot < len(self.gamepads) else None
+
+    def cycle_pad_slot(self, player_idx: int, step: int) -> None:
+        slots: List[Optional[int]]
+        other_slot: Optional[int]
+        current: Optional[int]
+        if player_idx == 0:
+            other_slot = self.p2_pad_slot
+            current = self.p1_pad_slot
+            slots = [None] + [i for i in range(len(self.gamepads)) if i != other_slot]
+        else:
+            other_slot = self.p1_pad_slot
+            current = self.p2_pad_slot
+            slots = [i for i in range(len(self.gamepads)) if i != other_slot]
+            if not slots:
+                slots = [None]
+
+        if not slots:
+            return
+        if current not in slots:
+            current = slots[0]
+        idx = slots.index(current)
+        nxt = slots[(idx + step) % len(slots)]
+        if player_idx == 0:
+            self.p1_pad_slot = nxt
+        else:
+            self.p2_pad_slot = nxt
+            if self.p2_pad_slot is None and len(self.gamepads) > 0:
+                self.p2_pad_slot = 0
+        self.ensure_valid_pad_assignments()
+        self.apply_pad_assignments()
 
     def read_axis(self, pad: Optional[pygame.joystick.Joystick], idx: int) -> float:
         if pad is None or idx >= pad.get_numaxes():
@@ -1006,6 +1096,8 @@ class Game:
         p.mining_progress = 0.0
         p.break_pulse = 0.0
         p.health = PLAYER_MAX_HEALTH
+        p.health_display = PLAYER_MAX_HEALTH
+        p.health_hit_flash = 0.0
         p.death_fade_timer = 0.0
         p.death_hold_timer = 0.0
         self.reset_player_up(player_idx)
@@ -1022,6 +1114,18 @@ class Game:
                 p.death_hold_timer = max(0.0, p.death_hold_timer - dt)
             if p.death_fade_timer <= 0.0 and p.death_hold_timer <= 0.0:
                 self.respawn_player(i)
+
+    def update_health_feedback(self, dt: float) -> None:
+        for p in self.players:
+            target = clamp(p.health, 0.0, PLAYER_MAX_HEALTH)
+            if target < p.health_display:
+                p.health_hit_flash = max(p.health_hit_flash, 1.0)
+                # Keep a visible lag so HP drops are unmistakable.
+                p.health_display = max(target, p.health_display - dt * 28.0)
+            else:
+                p.health_display = target
+            if p.health_hit_flash > 0.0:
+                p.health_hit_flash = max(0.0, p.health_hit_flash - dt * 1.5)
 
     def update_mines(self, dt: float) -> None:
         if not self.mines:
@@ -1192,6 +1296,180 @@ class Game:
         look = self.stabilize_view_direction(player_idx, look)
         self.set_look_dir(player_idx, look)
 
+    def process_title_input(self) -> None:
+        elapsed = pygame.time.get_ticks() * 0.001 - self.title_screen_started_at
+        can_dismiss = elapsed >= TITLE_MIN_SECONDS
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.running = False
+                elif can_dismiss and event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    self.in_title_screen = False
+            elif can_dismiss and event.type == pygame.MOUSEBUTTONDOWN:
+                self.in_title_screen = False
+            elif event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
+                self.refresh_gamepads()
+
+        if self.in_title_screen and can_dismiss:
+            for pad in self.gamepads:
+                if pad is not None and pad.get_numbuttons() > 0 and pad.get_button(0):
+                    self.in_title_screen = False
+                    break
+
+        if not self.in_title_screen:
+            self.reset_players_for_match_start()
+            pygame.event.set_grab(True)
+            pygame.mouse.set_visible(False)
+            pygame.mouse.set_pos(self.screen_center)
+            pygame.mouse.get_rel()
+            pygame.event.clear(pygame.MOUSEMOTION)
+            self.players[0].mouse_settle_frames = max(self.players[0].mouse_settle_frames, 2)
+
+    def reset_players_for_match_start(self) -> None:
+        for i, p in enumerate(self.players):
+            spawn = self.initial_spawn_points[i]
+            p.x, p.y, p.z = spawn
+            p.vx = p.vy = p.vz = 0.0
+            p.on_ground = False
+            p.mining_target = None
+            p.mining_progress = 0.0
+            p.break_pulse = 0.0
+            p.coyote_timer = 0.0
+            p.jump_buffer_timer = 0.0
+            p.jump_was_down = False
+            p.health = PLAYER_MAX_HEALTH
+            p.health_display = PLAYER_MAX_HEALTH
+            p.health_hit_flash = 0.0
+            p.death_fade_timer = 0.0
+            p.death_hold_timer = 0.0
+            self.reset_player_up(i)
+            self.stabilize_player_spawn(i)
+            self.reset_player_up(i)
+
+    def render_title_screen(self) -> None:
+        t = pygame.time.get_ticks() * 0.001
+        pulse = 0.6 + 0.4 * (0.5 + 0.5 * math.sin(t * 2.1))
+        ember_wobble = math.sin(t * 0.8) * 22.0
+
+        glViewport(0, 0, self.width, self.height)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        glOrtho(0, self.width, self.height, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        glDisable(GL_LIGHTING)
+        glDisable(GL_TEXTURE_2D)
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        # Layered background gradient.
+        bands = 44
+        for i in range(bands):
+            y0 = (self.height * i) / bands
+            y1 = (self.height * (i + 1)) / bands
+            k = i / max(1, bands - 1)
+            r = 0.05 + 0.14 * k
+            g = 0.03 + 0.06 * k
+            b = 0.03 + 0.04 * k
+            glColor3f(r, g, b)
+            glBegin(GL_QUADS)
+            glVertex2f(0, y0)
+            glVertex2f(self.width, y0)
+            glVertex2f(self.width, y1)
+            glVertex2f(0, y1)
+            glEnd()
+
+        # Hellish horizon wedge.
+        glColor4f(0.26, 0.10, 0.06, 0.92)
+        glBegin(GL_TRIANGLES)
+        glVertex2f(-40.0, self.height)
+        glVertex2f(self.width * 0.56 + ember_wobble, self.height * 0.42)
+        glVertex2f(self.width, self.height)
+        glEnd()
+
+        # Slanted smoke streaks.
+        glColor4f(0.38, 0.17, 0.10, 0.20)
+        for x in range(0, self.width, 18):
+            glBegin(GL_LINES)
+            glVertex2f(float(x), 0.0)
+            glVertex2f(float(x - 210), float(self.height))
+            glEnd()
+
+        # Vignette to darken edges.
+        edge = 120.0
+        glColor4f(0.0, 0.0, 0.0, 0.35)
+        glBegin(GL_QUADS)
+        glVertex2f(0.0, 0.0)
+        glVertex2f(edge, 0.0)
+        glVertex2f(edge, self.height)
+        glVertex2f(0.0, self.height)
+        glVertex2f(self.width - edge, 0.0)
+        glVertex2f(self.width, 0.0)
+        glVertex2f(self.width, self.height)
+        glVertex2f(self.width - edge, self.height)
+        glVertex2f(0.0, 0.0)
+        glVertex2f(self.width, 0.0)
+        glVertex2f(self.width, edge)
+        glVertex2f(0.0, edge)
+        glVertex2f(0.0, self.height - edge)
+        glVertex2f(self.width, self.height - edge)
+        glVertex2f(self.width, self.height)
+        glVertex2f(0.0, self.height)
+        glEnd()
+
+        # Center panel and trim.
+        panel_w = self.width * 0.70
+        panel_h = self.height * 0.55
+        panel_x = (self.width - panel_w) * 0.5
+        panel_y = (self.height - panel_h) * 0.34
+        glColor4f(0.03, 0.03, 0.03, 0.66)
+        glBegin(GL_QUADS)
+        glVertex2f(panel_x, panel_y)
+        glVertex2f(panel_x + panel_w, panel_y)
+        glVertex2f(panel_x + panel_w, panel_y + panel_h)
+        glVertex2f(panel_x, panel_y + panel_h)
+        glEnd()
+        glColor4f(0.62, 0.44, 0.22, 0.65)
+        glLineWidth(2.0)
+        glBegin(GL_LINE_LOOP)
+        glVertex2f(panel_x, panel_y)
+        glVertex2f(panel_x + panel_w, panel_y)
+        glVertex2f(panel_x + panel_w, panel_y + panel_h)
+        glVertex2f(panel_x, panel_y + panel_h)
+        glEnd()
+
+        cx = self.width * 0.5
+        cy = self.height * 0.44
+        tx = cx - 290.0
+        self.draw_screen_text(tx, cy - 112.0, "THE WAR BELOW", (240, 216, 138, 255), font=self.ui_font_title)
+        self.draw_screen_text(tx + 1.0, cy - 111.0, "THE WAR BELOW", (90, 25, 15, 120), font=self.ui_font_title)
+        self.draw_screen_text(tx + 10.0, cy - 46.0, "This ain't Minecraft anymore!", (255, 228, 112, 255), font=self.ui_font_subtitle)
+        self.draw_screen_text(tx + 10.0, cy - 6.0, "Two players. One cube-world. Dig or be buried.", (222, 194, 136, 255), small=True)
+
+        deploy_col = int(185 + 70 * pulse)
+        self.draw_screen_text(
+            tx + 10.0,
+            cy + 48.0,
+            "Press Enter / Space / Click / Gamepad A to deploy",
+            (255, deploy_col, 96, 255),
+            small=True,
+        )
+        remaining = max(0.0, TITLE_MIN_SECONDS - (pygame.time.get_ticks() * 0.001 - self.title_screen_started_at))
+        if remaining > 0.0:
+            self.draw_screen_text(tx + 10.0, cy + 64.0, f"Stand by... {remaining:.1f}s", (255, 208, 120, 255), small=True)
+        self.draw_screen_text(tx + 10.0, cy + 80.0, "Esc to quit", (190, 171, 130, 255), small=True)
+        self.draw_screen_text(tx + 10.0, cy + 112.0, "C in-game opens full control reference", (176, 159, 124, 255), small=True)
+
+        glDisable(GL_BLEND)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_TEXTURE_2D)
+        glEnable(GL_CULL_FACE)
+        glEnable(GL_LIGHTING)
+
     def stabilize_view_direction(self, player_idx: int, look: Vec3f) -> Vec3f:
         _ = player_idx
         return v_norm(look)
@@ -1222,6 +1500,17 @@ class Game:
                     self.selected_block = WOOD
                 elif event.key == pygame.K_e:
                     self.place_mine(0)
+                elif event.key == pygame.K_c:
+                    self.show_controls_help = not self.show_controls_help
+                elif self.show_controls_help and event.key == pygame.K_F1:
+                    self.cycle_pad_slot(0, 1)
+                elif self.show_controls_help and event.key == pygame.K_F2:
+                    self.cycle_pad_slot(1, 1)
+                elif self.show_controls_help and event.key == pygame.K_F3:
+                    self.auto_assign_gamepads()
+                    self.apply_pad_assignments()
+                elif self.show_controls_help and event.key == pygame.K_F5:
+                    self.refresh_gamepads()
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 3:
                     self.place_block(0)
@@ -2100,9 +2389,12 @@ class Game:
 
     def render_health_bar(self, player_idx: int, view_w: int, view_h: int) -> None:
         p = self.players[player_idx]
-        pct = clamp(p.health / PLAYER_MAX_HEALTH, 0.0, 1.0)
+        pct_raw = p.health / max(1e-5, PLAYER_MAX_HEALTH)
+        pct = clamp(pct_raw if math.isfinite(pct_raw) else 1.0, 0.0, 1.0)
+        shown_raw = p.health_display / max(1e-5, PLAYER_MAX_HEALTH)
+        shown_pct = clamp(shown_raw if math.isfinite(shown_raw) else 1.0, 0.0, 1.0)
         w = min(260.0, view_w * 0.50)
-        h = 20.0
+        h = 22.0
         margin = 14.0
         x = view_w - w - margin
         y = view_h - h - margin
@@ -2110,24 +2402,17 @@ class Game:
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-        glColor4f(0.0, 0.0, 0.0, 0.62)
+        # Outer panel.
+        glColor4f(0.0, 0.0, 0.0, 0.72)
         glBegin(GL_QUADS)
-        glVertex2f(x - 4.0, y - 4.0)
-        glVertex2f(x + w + 4.0, y - 4.0)
-        glVertex2f(x + w + 4.0, y + h + 4.0)
-        glVertex2f(x - 4.0, y + h + 4.0)
+        glVertex2f(x - 5.0, y - 5.0)
+        glVertex2f(x + w + 5.0, y - 5.0)
+        glVertex2f(x + w + 5.0, y + h + 5.0)
+        glVertex2f(x - 5.0, y + h + 5.0)
         glEnd()
 
-        glColor3f(0.10, 0.08, 0.03)
-        glBegin(GL_QUADS)
-        glVertex2f(x, y)
-        glVertex2f(x + w, y)
-        glVertex2f(x + w, y + h)
-        glVertex2f(x, y + h)
-        glEnd()
-
-        # Health starts fully yellow and contracts as damage is taken.
-        glColor3f(1.0, 0.93, 0.20)
+        # Empty bar background.
+        glColor3f(0.11, 0.07, 0.03)
         glBegin(GL_QUADS)
         glVertex2f(x, y)
         glVertex2f(x + w, y)
@@ -2135,19 +2420,67 @@ class Game:
         glVertex2f(x, y + h)
         glEnd()
 
-        if pct < 1.0:
-            missing_x = x + w * pct
-            glColor3f(0.10, 0.08, 0.03)
+        # Main fill (solid yellow when full).
+        fill_w = w * pct
+        if fill_w > 0.0:
+            glColor3f(1.0, 0.96, 0.10)
             glBegin(GL_QUADS)
-            glVertex2f(missing_x, y)
-            glVertex2f(x + w, y)
-            glVertex2f(x + w, y + h)
-            glVertex2f(missing_x, y + h)
+            glVertex2f(x, y)
+            glVertex2f(x + fill_w, y)
+            glVertex2f(x + fill_w, y + h)
+            glVertex2f(x, y + h)
+            glEnd()
+
+        # Trailing damage segment.
+        if shown_pct > pct + 1e-4:
+            seg_x0 = x + w * pct
+            seg_x1 = x + w * shown_pct
+            pulse = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.02))
+            alpha = clamp(0.34 + p.health_hit_flash * pulse, 0.34, 0.95)
+            glColor4f(1.0, 0.24, 0.10, alpha)
+            glBegin(GL_QUADS)
+            glVertex2f(seg_x0, y + 2.0)
+            glVertex2f(seg_x1, y + 2.0)
+            glVertex2f(seg_x1, y + h - 2.0)
+            glVertex2f(seg_x0, y + h - 2.0)
+            glEnd()
+
+        # Current health marker.
+        edge_x = x + w * pct
+        glLineWidth(2.5)
+        glColor3f(1.0, 1.0, 0.92)
+        glBegin(GL_LINES)
+        glVertex2f(edge_x, y - 3.0)
+        glVertex2f(edge_x, y + h + 3.0)
+        glEnd()
+        glLineWidth(1.0)
+
+        # Quarter ticks to make drop distance obvious.
+        glColor4f(0.36, 0.29, 0.10, 0.75)
+        for i in range(1, 4):
+            tx = x + w * (i * 0.25)
+            glBegin(GL_LINES)
+            glVertex2f(tx, y + 2.0)
+            glVertex2f(tx, y + h - 2.0)
+            glEnd()
+
+        if p.health_hit_flash > 0.0:
+            pulse = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.03))
+            flash_a = clamp(p.health_hit_flash * pulse, 0.0, 0.9)
+            glColor4f(1.0, 0.14, 0.06, flash_a * 0.42)
+            glBegin(GL_QUADS)
+            glVertex2f(x - 10.0, y - 8.0)
+            glVertex2f(x + w + 10.0, y - 8.0)
+            glVertex2f(x + w + 10.0, y + h + 8.0)
+            glVertex2f(x - 10.0, y + h + 8.0)
             glEnd()
 
         # Bright border to ensure visibility in dark scenes.
         glLineWidth(2.5)
-        glColor3f(1.0, 0.95, 0.34)
+        border_r = 1.0
+        border_g = 0.95 - 0.45 * p.health_hit_flash
+        border_b = 0.34 - 0.22 * p.health_hit_flash
+        glColor3f(border_r, max(0.18, border_g), max(0.10, border_b))
         glBegin(GL_LINE_LOOP)
         glVertex2f(x - 1.5, y - 1.5)
         glVertex2f(x + w + 1.5, y - 1.5)
@@ -2156,13 +2489,6 @@ class Game:
         glEnd()
         glLineWidth(1.0)
 
-        # Center notch marker.
-        mx = x + w * 0.5
-        glColor3f(0.32, 0.24, 0.06)
-        glBegin(GL_LINES)
-        glVertex2f(mx, y)
-        glVertex2f(mx, y + h)
-        glEnd()
         if not was_blend:
             glDisable(GL_BLEND)
 
@@ -2565,9 +2891,144 @@ class Game:
         glEnable(GL_TEXTURE_2D)
         glEnable(GL_LIGHTING)
 
+    def draw_screen_text(
+        self,
+        x: float,
+        y: float,
+        text: str,
+        color: Tuple[int, int, int, int] = (255, 240, 180, 255),
+        small: bool = True,
+        font: Optional[pygame.font.Font] = None,
+    ) -> None:
+        if font is None:
+            font = self.ui_font_small if small else self.ui_font
+        surf = font.render(text, True, color[:3])
+        rgba = pygame.image.tostring(surf, "RGBA", True)
+        glWindowPos2f(float(x), float(self.height - y - surf.get_height()))
+        glDrawPixels(surf.get_width(), surf.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, rgba)
+
+    def gamepad_live_status(self, pad: Optional[pygame.joystick.Joystick]) -> str:
+        if pad is None:
+            return "not connected"
+        lx = self.read_axis(pad, 0)
+        ly = self.read_axis(pad, 1)
+        rx = self.read_axis(pad, 2)
+        ry = self.read_axis(pad, 3)
+        pressed: List[str] = []
+        max_btn = min(10, pad.get_numbuttons())
+        for i in range(max_btn):
+            if pad.get_button(i):
+                pressed.append(str(i))
+        btn_text = ",".join(pressed) if pressed else "-"
+        return f"LS({lx:+.2f},{ly:+.2f}) RS({rx:+.2f},{ry:+.2f}) BTN[{btn_text}]"
+
+    def render_controls_overlay_screen(self) -> None:
+        if not self.show_controls_help:
+            return
+
+        was_blend = glIsEnabled(GL_BLEND)
+        glViewport(0, 0, self.width, self.height)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        glOrtho(0, self.width, self.height, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        glDisable(GL_LIGHTING)
+        glDisable(GL_TEXTURE_2D)
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_CULL_FACE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        pad = 26.0
+        glColor4f(0.0, 0.0, 0.0, 0.76)
+        glBegin(GL_QUADS)
+        glVertex2f(pad, pad)
+        glVertex2f(self.width - pad, pad)
+        glVertex2f(self.width - pad, self.height - pad)
+        glVertex2f(pad, self.height - pad)
+        glEnd()
+
+        col_w = (self.width - pad * 3.0) * 0.5
+        left_x = pad + 18.0
+        right_x = pad * 2.0 + col_w + 18.0
+        top_y = pad + 14.0
+
+        self.draw_screen_text(left_x, top_y, "Controls (Press C to close)", (255, 242, 120, 255), small=False)
+        self.draw_screen_text(left_x, top_y + 36.0, "Player 1 - Keyboard/Mouse (+optional gamepad)", (255, 255, 170, 255), small=True)
+        self.draw_screen_text(left_x, top_y + 58.0, "W/A/S/D move    Mouse look    Space jump", (235, 230, 210, 255))
+        self.draw_screen_text(left_x, top_y + 80.0, "LMB hold mine   RMB place block   E place mine", (235, 230, 210, 255))
+        self.draw_screen_text(left_x, top_y + 102.0, "1/2/3 select block   . show player lines", (235, 230, 210, 255))
+        self.draw_screen_text(left_x, top_y + 136.0, "P1 Gamepad: LS move, RS look, A jump", (220, 225, 205, 255))
+        self.draw_screen_text(left_x, top_y + 158.0, "RB mine, X place block, Y place mine, B/LB cycle block", (220, 225, 205, 255))
+
+        self.draw_screen_text(right_x, top_y + 36.0, "Player 2 - Gamepad required", (255, 255, 170, 255), small=True)
+        self.draw_screen_text(right_x, top_y + 58.0, "LS move    RS look    A jump", (235, 230, 210, 255))
+        self.draw_screen_text(right_x, top_y + 80.0, "RB mine    X place block    Y place mine", (235, 230, 210, 255))
+        self.draw_screen_text(right_x, top_y + 102.0, "B/LB cycle block", (235, 230, 210, 255))
+
+        self.draw_screen_text(right_x, top_y + 136.0, "Shared", (255, 255, 170, 255), small=True)
+        self.draw_screen_text(right_x, top_y + 158.0, "Esc quit   C toggle this help", (235, 230, 210, 255))
+
+        status_y = top_y + 206.0
+        self.draw_screen_text(left_x, status_y, "USB Gamepad Setup", (255, 232, 130, 255), small=True)
+        self.draw_screen_text(left_x, status_y + 22.0, "F1 cycle P1 pad    F2 cycle P2 pad", (225, 220, 205, 255))
+        self.draw_screen_text(left_x, status_y + 44.0, "F3 auto-assign pads    F5 rescan USB pads", (225, 220, 205, 255))
+
+        p1_name = "None"
+        p2_name = "None"
+        if self.p1_pad is not None:
+            p1_name = f"#{self.p1_pad_slot} {self.p1_pad.get_name()}"
+        if self.p2_pad is not None:
+            p2_name = f"#{self.p2_pad_slot} {self.p2_pad.get_name()}"
+        self.draw_screen_text(left_x, status_y + 72.0, f"P1 assigned: {p1_name}", (255, 246, 170, 255))
+        self.draw_screen_text(left_x, status_y + 94.0, f"P2 assigned: {p2_name}", (255, 246, 170, 255))
+        self.draw_screen_text(left_x, status_y + 124.0, f"P1 live: {self.gamepad_live_status(self.p1_pad)}", (242, 238, 208, 255))
+        self.draw_screen_text(left_x, status_y + 146.0, f"P2 live: {self.gamepad_live_status(self.p2_pad)}", (242, 238, 208, 255))
+
+        detected = len(self.gamepads)
+        detect_col = (255, 246, 170, 255) if detected > 0 else (255, 120, 120, 255)
+        self.draw_screen_text(right_x, status_y, f"Detected USB gamepads: {detected}", detect_col, small=True)
+        max_list = min(5, len(self.gamepads))
+        for i in range(max_list):
+            pad = self.gamepads[i]
+            flags: List[str] = []
+            if self.p1_pad_slot == i:
+                flags.append("P1")
+            if self.p2_pad_slot == i:
+                flags.append("P2")
+            label = ",".join(flags) if flags else "free"
+            axes = pad.get_numaxes()
+            btns = pad.get_numbuttons()
+            self.draw_screen_text(
+                right_x,
+                status_y + 24.0 + i * 22.0,
+                f"#{i} [{label}] {pad.get_name()}  ({axes} axes, {btns} btn)",
+                (230, 226, 206, 255),
+            )
+        if len(self.gamepads) == 0:
+            self.draw_screen_text(right_x, status_y + 24.0, "No controller detected. Plug in USB/Bluetooth pad, then press F5.", (255, 156, 130, 255))
+
+        if not was_blend:
+            glDisable(GL_BLEND)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_TEXTURE_2D)
+        glEnable(GL_CULL_FACE)
+        glEnable(GL_LIGHTING)
+
     def run(self) -> None:
         while self.running:
             dt = min(self.clock.tick(60) / 1000.0, 0.05)
+            if self.in_title_screen:
+                if not pygame.mouse.get_visible():
+                    pygame.mouse.set_visible(True)
+                pygame.event.set_grab(False)
+                self.process_title_input()
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                self.render_title_screen()
+                pygame.display.flip()
+                continue
+
             if pygame.mouse.get_visible():
                 pygame.mouse.set_visible(False)
             pygame.event.set_grab(True)
@@ -2579,6 +3040,7 @@ class Game:
             self.update_explosion_effects(dt)
             self.update_xray_beams(dt)
             self.update_respawns(dt)
+            self.update_health_feedback(dt)
             self.update_dirty_meshes(per_frame=5)
 
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -2586,6 +3048,7 @@ class Game:
             self.render_player_view(0, 0, 0, half_w, self.height)
             self.render_player_view(1, half_w, 0, self.width - half_w, self.height)
             self.render_death_overlays_screen(half_w)
+            self.render_controls_overlay_screen()
 
             # Divider between splits.
             glViewport(0, 0, self.width, self.height)
