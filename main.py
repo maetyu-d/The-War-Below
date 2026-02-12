@@ -39,6 +39,7 @@ MINE_FUSE_SECONDS = 10.0
 MINE_RENDER_DISTANCE = 42.0
 MINE_SPHERE_STACKS = 4
 MINE_SPHERE_SLICES = 8
+PROX_MINE_TRIGGER_RANGE = 2.0
 MINE_TIME_DIRT = 0.48
 MINE_TIME_STONE = 0.95
 MINE_TIME_WOOD = 0.72
@@ -477,6 +478,7 @@ class Game:
         self.dirty_chunks: Set[ChunkKey] = set()
         self.build_all_chunk_meshes()
         self.mines: Dict[Vec3i, Dict[str, object]] = {}
+        self.populate_proximity_mines()
 
         self.selected_block = DIRT
         self.break_particles: List[Dict[str, float]] = []
@@ -741,6 +743,22 @@ class Game:
 
         if (axis, sign) not in self.hazard_faces:
             return False
+
+        # Restrict toxicity to the true outer cube face for this axis/sign,
+        # not arbitrary exposed side faces from local terrain relief.
+        fx = x + 0.5 + 0.5 * nx
+        fy = y + 0.5 + 0.5 * ny
+        fz = z + 0.5 + 0.5 * nz
+        rel = (fx - self.world.cx, fy - self.world.cy, fz - self.world.cz)
+        dom_axis = 0
+        if abs(rel[1]) > abs(rel[dom_axis]):
+            dom_axis = 1
+        if abs(rel[2]) > abs(rel[dom_axis]):
+            dom_axis = 2
+        dom_sign = 1 if rel[dom_axis] >= 0.0 else -1
+        if dom_axis != axis or dom_sign != sign:
+            return False
+
         key = self.hazard_surface_key(axis, sign, x, y, z)
         if key is None:
             return False
@@ -930,6 +948,84 @@ class Game:
             "support": support,
         }
 
+    def populate_proximity_mines(self) -> None:
+        if not self.hazard_faces:
+            return
+        for axis, sign in self.hazard_faces:
+            placed = False
+            tries = 0
+            while tries < 160:
+                tries += 1
+                support = self.random_face_support(axis, sign)
+                if support is None:
+                    continue
+                if self.try_place_proximity_mine(axis, sign, support):
+                    placed = True
+                    break
+            if placed:
+                continue
+
+            # Deterministic fallback so each toxic face always gets one mine.
+            support = self.find_face_support_fallback(axis, sign)
+            if support is not None:
+                self.try_place_proximity_mine(axis, sign, support)
+
+    def try_place_proximity_mine(self, axis: int, sign: int, support: Vec3i) -> bool:
+        mine_pos = (
+            support[0] + (sign if axis == 0 else 0),
+            support[1] + (sign if axis == 1 else 0),
+            support[2] + (sign if axis == 2 else 0),
+        )
+        if not self.world.in_bounds(*mine_pos):
+            return False
+        if self.world.block_at(*mine_pos) != AIR or mine_pos in self.mines:
+            return False
+        if any(self.player_intersects(i, *mine_pos) for i in range(len(self.players))):
+            return False
+
+        n = (sign if axis == 0 else 0, sign if axis == 1 else 0, sign if axis == 2 else 0)
+        ref = (0.0, 1.0, 0.0) if abs(n[1]) < 0.9 else (1.0, 0.0, 0.0)
+        tangent_u = v_norm(v_cross(ref, (float(n[0]), float(n[1]), float(n[2]))))
+        tangent_v = v_norm(v_cross((float(n[0]), float(n[1]), float(n[2])), tangent_u))
+        up_i = self.snap_axis_dir((float(n[0]), float(n[1]), float(n[2])))
+        right_i = self.snap_axis_dir(tangent_u, (up_i,))
+        fwd_i = self.snap_axis_dir(tangent_v, (up_i, right_i))
+
+        self.mines[mine_pos] = {
+            "kind": "proximity",
+            "owner": -1,
+            "pos": mine_pos,
+            "normal": n,
+            "support": support,
+            "up": up_i,
+            "right": right_i,
+            "forward": fwd_i,
+        }
+        return True
+
+    def find_face_support_fallback(self, axis: int, sign: int) -> Optional[Vec3i]:
+        center = [self.world.cx, self.world.cy, self.world.cz]
+        outer = int(round(clamp(center[axis] + sign * (CUBE_HALF + FACE_RELIEF + 1), 0, (WORLD_X if axis == 0 else WORLD_Y if axis == 1 else WORLD_Z) - 1)))
+        other_axes = [0, 1, 2]
+        other_axes.remove(axis)
+        max_step = max(WORLD_X, WORLD_Y, WORLD_Z)
+        for radius in range(max_step):
+            for du in range(-radius, radius + 1):
+                for dv in range(-radius, radius + 1):
+                    if max(abs(du), abs(dv)) != radius:
+                        continue
+                    coords = [0, 0, 0]
+                    coords[other_axes[0]] = clamp(center[other_axes[0]] + du, 1, (WORLD_X if other_axes[0] == 0 else WORLD_Y if other_axes[0] == 1 else WORLD_Z) - 2)
+                    coords[other_axes[1]] = clamp(center[other_axes[1]] + dv, 1, (WORLD_X if other_axes[1] == 0 else WORLD_Y if other_axes[1] == 1 else WORLD_Z) - 2)
+                    for step in range(max_step):
+                        coords[axis] = outer - sign * step
+                        x, y, z = int(coords[0]), int(coords[1]), int(coords[2])
+                        if not self.world.in_bounds(x, y, z):
+                            continue
+                        if self.world.block_at(x, y, z) != AIR:
+                            return (x, y, z)
+        return None
+
     def mine_anchor_cell(self, mine: Dict[str, object]) -> Optional[Vec3i]:
         support = mine.get("support")
         if not isinstance(support, tuple):
@@ -1104,10 +1200,22 @@ class Game:
                 if isinstance(pos, tuple):
                     unsupported.append(pos)
                 continue
-            t = float(mine["timer"]) - dt
-            mine["timer"] = t
-            if t <= 0.0:
-                to_detonate.append(mine)
+            kind = str(mine.get("kind", "timed"))
+            if kind == "proximity":
+                pos = mine.get("pos")
+                if not isinstance(pos, tuple):
+                    continue
+                center = (pos[0] + 0.5, pos[1] + 0.5, pos[2] + 0.5)
+                for p in self.players:
+                    d2 = (p.x - center[0]) ** 2 + (p.y - center[1]) ** 2 + (p.z - center[2]) ** 2
+                    if d2 <= PROX_MINE_TRIGGER_RANGE * PROX_MINE_TRIGGER_RANGE:
+                        to_detonate.append(mine)
+                        break
+            else:
+                t = float(mine["timer"]) - dt
+                mine["timer"] = t
+                if t <= 0.0:
+                    to_detonate.append(mine)
 
         for pos in unsupported:
             self.mines.pop(pos, None)
@@ -2091,7 +2199,8 @@ class Game:
 
         # Opaque mine bodies.
         for mine, center, n, u, v, _ in visible:
-            timer = float(mine.get("timer", 0.0))
+            kind = str(mine.get("kind", "timed"))
+            timer = float(mine.get("timer", 0.0)) if kind == "timed" else 0.0
 
             r = 0.22
 
@@ -2115,11 +2224,50 @@ class Game:
                 glEnd()
 
             # Flashing indicator on top.
-            elapsed = MINE_FUSE_SECONDS - timer
-            flash = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(elapsed * 11.0))
-            glDisable(GL_LIGHTING)
-            glColor4f(0.82 * flash, 0.07 * flash, 0.03 * flash, 1.0)
-            led_r = 0.08
+            if kind == "proximity":
+                elapsed = pygame.time.get_ticks() * 0.001
+                flash = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(elapsed * 8.0))
+                # 2x larger dome-like orange glow for strong visibility.
+                glDisable(GL_LIGHTING)
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+                dome_center = v_add(center, v_scale(n, r * 0.10))
+                dome_r = 4.20
+                dome_stacks = 6
+                dome_slices = 24
+                for si in range(dome_stacks):
+                    t0 = (math.pi * 0.5) * si / dome_stacks
+                    t1 = (math.pi * 0.5) * (si + 1) / dome_stacks
+                    fade = 1.0 - (si / max(1.0, float(dome_stacks)))
+                    glColor4f(1.0, 0.50 + 0.20 * fade, 0.10 + 0.12 * fade, (0.08 + 0.22 * flash) * fade)
+                    glBegin(GL_TRIANGLE_STRIP)
+                    for j in range(dome_slices + 1):
+                        p_ang = (math.pi * 2.0 * j) / dome_slices
+                        cp = math.cos(p_ang)
+                        sp = math.sin(p_ang)
+                        for t_ang in (t0, t1):
+                            st = math.sin(t_ang)
+                            ct = math.cos(t_ang)
+                            radial = dome_r * st
+                            h = dome_r * ct
+                            point = v_add(
+                                dome_center,
+                                v_add(
+                                    v_scale(n, h),
+                                    v_add(v_scale(u, cp * radial), v_scale(v, sp * radial)),
+                                ),
+                            )
+                            glVertex3f(point[0], point[1], point[2])
+                    glEnd()
+                glDisable(GL_LIGHTING)
+                glColor4f(1.0 * flash, 0.45 * flash, 0.08 * flash, 1.0)
+                led_r = 0.24
+            else:
+                elapsed = MINE_FUSE_SECONDS - timer
+                flash = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(elapsed * 11.0))
+                glDisable(GL_LIGHTING)
+                glColor4f(0.82 * flash, 0.07 * flash, 0.03 * flash, 1.0)
+                led_r = 0.08
             led_center = v_add(center, v_scale(n, r + 0.004))
             glBegin(GL_TRIANGLE_FAN)
             glVertex3f(led_center[0], led_center[1], led_center[2])
@@ -2130,6 +2278,10 @@ class Game:
                 edge = v_add(led_center, v_add(v_scale(u, c * led_r), v_scale(v, s * led_r)))
                 glVertex3f(edge[0], edge[1], edge[2])
             glEnd()
+            if kind == "proximity":
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                if not was_blend:
+                    glDisable(GL_BLEND)
             glEnable(GL_LIGHTING)
 
         glEnable(GL_CULL_FACE)
@@ -2627,6 +2779,30 @@ class Game:
             a = (math.pi * 2.0 * i) / 16.0
             glVertex2f(center_x + bx + math.cos(a) * 5.0, center_y + by + math.sin(a) * 5.0)
         glEnd()
+
+        # Proximity-mine blips (light blue).
+        mine_pulse = 0.68 + 0.32 * (0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.010))
+        for mine in self.mines.values():
+            if str(mine.get("kind", "timed")) != "proximity":
+                continue
+            mpos = mine.get("pos")
+            if not isinstance(mpos, tuple):
+                continue
+            mcenter = (mpos[0] + 0.5, mpos[1] + 0.5, mpos[2] + 0.5)
+            mrel = v_sub(mcenter, pos)
+            mx = v_dot(mrel, right)
+            mz = v_dot(mrel, fwd)
+            mbx = clamp(mx * scale, -radar_r + 3.0, radar_r - 3.0)
+            mby = clamp(-mz * scale, -radar_r + 3.0, radar_r - 3.0)
+            mdist = math.sqrt(mx * mx + mz * mz)
+            mine_col = (0.48, 0.95, 1.0) if mdist <= max_range else (0.30, 0.75, 0.90)
+            glColor3f(mine_col[0] * mine_pulse, mine_col[1] * mine_pulse, mine_col[2] * mine_pulse)
+            glBegin(GL_TRIANGLE_FAN)
+            glVertex2f(center_x + mbx, center_y + mby)
+            for i in range(13):
+                a = (math.pi * 2.0 * i) / 12.0
+                glVertex2f(center_x + mbx + math.cos(a) * 3.2, center_y + mby + math.sin(a) * 3.2)
+            glEnd()
 
         # Show the other player's facing direction on radar.
         other_fwd = self.look_dir(other_idx)
