@@ -482,6 +482,8 @@ class Game:
         self.build_all_chunk_meshes()
         self.mines: Dict[Vec3i, Dict[str, object]] = {}
         self.thrown_mines: List[Dict[str, float]] = []
+        self.mine_cook_active: List[bool] = [False, False]
+        self.mine_cook_time: List[float] = [0.0, 0.0]
         self.next_mine_throw_time: List[float] = [0.0, 0.0]
         self.populate_proximity_mines()
 
@@ -907,7 +909,7 @@ class Game:
                 return axis
         return candidates[0][1]
 
-    def place_mine(self, player_idx: int) -> None:
+    def place_mine(self, player_idx: int, cooked_time: float = 0.0) -> None:
         if not self.player_alive(player_idx):
             return
         now = pygame.time.get_ticks() * 0.001
@@ -921,6 +923,7 @@ class Game:
         eye = self.eye_pos(player_idx)
         launch_pos = v_add(eye, v_add(v_scale(fwd, 0.75), v_scale(up, -0.08)))
         launch_vel = v_add(v_scale(fwd, MINE_THROW_SPEED), v_scale(up, MINE_THROW_UP_BIAS))
+        remaining_fuse = max(0.05, MINE_FUSE_SECONDS - max(0.0, cooked_time))
         self.thrown_mines.append(
             {
                 "x": launch_pos[0],
@@ -939,10 +942,36 @@ class Game:
                 "fwdx": float(fwd_i[0]),
                 "fwdy": float(fwd_i[1]),
                 "fwdz": float(fwd_i[2]),
+                "fuse": remaining_fuse,
                 "age": 0.0,
             }
         )
         self.next_mine_throw_time[player_idx] = now + MINE_THROW_COOLDOWN
+
+    def update_mine_throw(self, player_idx: int, dt: float, throw_held: bool) -> None:
+        if not self.player_alive(player_idx):
+            self.mine_cook_active[player_idx] = False
+            self.mine_cook_time[player_idx] = 0.0
+            return
+
+        now = pygame.time.get_ticks() * 0.001
+        if throw_held:
+            if not self.mine_cook_active[player_idx]:
+                if now >= self.next_mine_throw_time[player_idx]:
+                    self.mine_cook_active[player_idx] = True
+                    self.mine_cook_time[player_idx] = 0.0
+            else:
+                self.mine_cook_time[player_idx] = clamp(
+                    self.mine_cook_time[player_idx] + dt,
+                    0.0,
+                    MINE_FUSE_SECONDS,
+                )
+            return
+
+        if self.mine_cook_active[player_idx]:
+            self.place_mine(player_idx, self.mine_cook_time[player_idx])
+            self.mine_cook_active[player_idx] = False
+            self.mine_cook_time[player_idx] = 0.0
 
     def arm_thrown_mine(self, thrown: Dict[str, float], key: Vec3i, support: Vec3i, normal: Vec3i) -> bool:
         if not self.world.in_bounds(*key) or not self.world.in_bounds(*support):
@@ -975,7 +1004,7 @@ class Game:
             "kind": "timed",
             "owner": owner,
             "pos": key,
-            "timer": MINE_FUSE_SECONDS,
+            "timer": float(thrown.get("fuse", MINE_FUSE_SECONDS)),
             "up": up_i,
             "right": right_i,
             "forward": fwd_i,
@@ -1230,6 +1259,7 @@ class Game:
             still_flying: List[Dict[str, float]] = []
             for mine in self.thrown_mines:
                 mine["age"] = float(mine.get("age", 0.0)) + dt
+                mine["fuse"] = float(mine.get("fuse", MINE_FUSE_SECONDS)) - dt
                 prev = (mine["x"], mine["y"], mine["z"])
                 gdir = self.gravity_dir(prev)
                 mine["vx"] += gdir[0] * GRAVITY * dt
@@ -1679,8 +1709,6 @@ class Game:
                     self.selected_block = STONE
                 elif event.key == pygame.K_3:
                     self.selected_block = WOOD
-                elif event.key == pygame.K_e:
-                    self.place_mine(0)
                 elif event.key == pygame.K_c:
                     self.show_controls_help = not self.show_controls_help
                 elif self.show_controls_help and event.key == pygame.K_F1:
@@ -1704,11 +1732,13 @@ class Game:
         p1_move_z = float((1 if keys[pygame.K_w] else 0) - (1 if keys[pygame.K_s] else 0))
         p1_jump = bool(keys[pygame.K_SPACE])
         p1_mine_hold = bool(pygame.mouse.get_pressed(3)[0])
+        p1_throw_hold = bool(keys[pygame.K_e])
 
         p2_move_x = 0.0
         p2_move_z = 0.0
         p2_jump = False
         p2_mine_hold = False
+        p2_throw_hold = False
 
         # Optional gamepad controls for Player 1 (keyboard/mouse still work).
         if self.p1_pad is not None:
@@ -1718,6 +1748,7 @@ class Game:
             p1_move_z = clamp(p1_move_z + gp_mz, -1.0, 1.0)
             p1_jump = p1_jump or self.read_button(self.p1_pad, 0)
             p1_mine_hold = p1_mine_hold or self.read_button(self.p1_pad, 5)
+            p1_throw_hold = p1_throw_hold or self.read_button(self.p1_pad, 3)
 
             lx = self.read_axis(self.p1_pad, 2)
             ly = self.read_axis(self.p1_pad, 3)
@@ -1725,8 +1756,6 @@ class Game:
 
             if self.edge_button(0, 2, self.read_button(self.p1_pad, 2)):
                 self.place_block(0)
-            if self.edge_button(0, 3, self.read_button(self.p1_pad, 3)):
-                self.place_mine(0)
             if self.edge_button(0, 1, self.read_button(self.p1_pad, 1)):
                 self.selected_block = DIRT if self.selected_block == WOOD else self.selected_block + 1
             if self.edge_button(0, 4, self.read_button(self.p1_pad, 4)):
@@ -1738,6 +1767,7 @@ class Game:
             p2_move_z = -self.read_axis(self.p2_pad, 1)
             p2_jump = self.read_button(self.p2_pad, 0)
             p2_mine_hold = self.read_button(self.p2_pad, 5)
+            p2_throw_hold = self.read_button(self.p2_pad, 3)
 
             lx2 = self.read_axis(self.p2_pad, 2)
             ly2 = self.read_axis(self.p2_pad, 3)
@@ -1745,8 +1775,6 @@ class Game:
 
             if self.edge_button(1, 2, self.read_button(self.p2_pad, 2)):
                 self.place_block(1)
-            if self.edge_button(1, 3, self.read_button(self.p2_pad, 3)):
-                self.place_mine(1)
             if self.edge_button(1, 1, self.read_button(self.p2_pad, 1)):
                 self.selected_block = DIRT if self.selected_block == WOOD else self.selected_block + 1
             if self.edge_button(1, 4, self.read_button(self.p2_pad, 4)):
@@ -1769,6 +1797,8 @@ class Game:
 
         self.update_mining(0, dt, p1_mine_hold)
         self.update_mining(1, dt, p2_mine_hold)
+        self.update_mine_throw(0, dt, p1_throw_hold)
+        self.update_mine_throw(1, dt, p2_throw_hold)
 
     def update_player_movement(self, player_idx: int, move_x: float, move_z: float, jump_pressed: bool, dt: float) -> None:
         p = self.players[player_idx]
@@ -2462,7 +2492,8 @@ class Game:
 
         glDisable(GL_LIGHTING)
         glDisable(GL_TEXTURE_2D)
-        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_DEPTH_TEST)
+        glDepthMask(GL_FALSE)
         glPointSize(5.0)
         glBegin(GL_POINTS)
         for p in self.break_particles:
@@ -2488,6 +2519,7 @@ class Game:
             glColor4f(p["r"], p["g"], p["b"], alpha * 0.9)
             glVertex3f(p["x"], p["y"], p["z"])
         glEnd()
+        glDepthMask(GL_TRUE)
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_TEXTURE_2D)
         glEnable(GL_LIGHTING)
@@ -2498,7 +2530,8 @@ class Game:
 
         glDisable(GL_LIGHTING)
         glDisable(GL_TEXTURE_2D)
-        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_DEPTH_TEST)
+        glDepthMask(GL_FALSE)
         glPointSize(16.0)
         glBegin(GL_POINTS)
         for p in self.explosion_particles:
@@ -2515,6 +2548,7 @@ class Game:
             glColor4f(rr, gg, bb, alpha)
             glVertex3f(p["x"], p["y"], p["z"])
         glEnd()
+        glDepthMask(GL_TRUE)
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_TEXTURE_2D)
         glEnable(GL_LIGHTING)
