@@ -2,6 +2,8 @@
 
 A split-screen, two-player tunneling warfare game built with Python + OpenGL (tested on macOS 13.7.8).
 
+![](https://github.com/maetyu-d/The-War-Below/blob/main/Screenshot%202026-02-12%20at%2014.44.55.png)
+
 ## Features
 - 2-player split-screen with both players having the same abilities.
 - Player 1 supports keyboard/mouse and optional gamepad.
