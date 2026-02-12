@@ -26,6 +26,7 @@ GRAVITY = 26.0
 JUMP_SPEED = 10.0
 PLAYER_SPEED = 7.0
 MOUSE_SENS = 0.0027
+LOOK_POLE_LIMIT = 0.992
 PLAYER_RADIUS = 0.35
 PLAYER_EYE_OFFSET = 0.62
 PLAYER_BODY_LOWER = -0.20
@@ -59,14 +60,11 @@ JUMP_BUFFER_TIME = 0.12
 FALL_GRAVITY_MULT = 1.18
 JUMP_CUT_GRAVITY_MULT = 1.95
 PLAYER_MAX_HEALTH = 100.0
-HAZARD_CONTACT_DPS = 5.0
+HAZARD_CONTACT_DPS = 10.0
 HAZARD_TINT = (0.82, 0.92, 0.16)
 HAZARD_TEX_INDEX = 4
+HAZARD_LAYER_THICKNESS = 2
 UP_SMOOTH_RATE = 10.0
-XRAY_MINE_COUNT_PER_FACE = 3
-XRAY_TRIGGER_RANGE = 2.4
-XRAY_RAY_RANGE = 14
-XRAY_BEAM_DURATION = 0.55
 DEATH_BLACKOUT_SECONDS = 5.0
 DEATH_FADE_SECONDS = 2.0
 TITLE_MIN_SECONDS = 3.0
@@ -458,6 +456,8 @@ class Game:
         self.spawn_faces = [(axis, sign_a), (axis, sign_b)]
         all_faces: List[Tuple[int, int]] = [(0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)]
         self.hazard_faces: Set[Tuple[int, int]] = {f for f in all_faces if f not in self.spawn_faces}
+        self.hazard_surface_faces: Dict[Tuple[int, int, int, int], int] = {}
+        self.rebuild_hazard_surface_cache()
         spawn_a = self.find_spawn_point(axis, sign_a)
         spawn_b = self.find_spawn_point(axis, sign_b)
         self.players: List[Player] = [
@@ -477,8 +477,6 @@ class Game:
         self.dirty_chunks: Set[ChunkKey] = set()
         self.build_all_chunk_meshes()
         self.mines: Dict[Vec3i, Dict[str, object]] = {}
-        self.xray_beams: List[Dict[str, object]] = []
-        self.populate_xray_mines()
 
         self.selected_block = DIRT
         self.break_particles: List[Dict[str, float]] = []
@@ -743,7 +741,70 @@ class Game:
 
         if (axis, sign) not in self.hazard_faces:
             return False
-        return sign * (face_coord - center) >= CUBE_HALF
+        key = self.hazard_surface_key(axis, sign, x, y, z)
+        if key is None:
+            return False
+        surface_face = self.hazard_surface_faces.get(key)
+        if surface_face is None:
+            return False
+        depth = sign * (surface_face - face_coord)
+        return 0 <= depth < HAZARD_LAYER_THICKNESS
+
+    def hazard_surface_key(self, axis: int, sign: int, x: int, y: int, z: int) -> Optional[Tuple[int, int, int, int]]:
+        _ = sign
+        if axis == 0:
+            return (axis, sign, y, z)
+        if axis == 1:
+            return (axis, sign, x, z)
+        if axis == 2:
+            return (axis, sign, x, y)
+        return None
+
+    def rebuild_hazard_surface_cache(self) -> None:
+        self.hazard_surface_faces = {}
+        if not self.hazard_faces:
+            return
+
+        for axis, sign in self.hazard_faces:
+            if axis == 0:
+                for y in range(WORLD_Y):
+                    for z in range(WORLD_Z):
+                        if sign > 0:
+                            for x in range(WORLD_X - 1, -1, -1):
+                                if self.world.block_at(x, y, z) != AIR:
+                                    self.hazard_surface_faces[(axis, sign, y, z)] = x + 1
+                                    break
+                        else:
+                            for x in range(WORLD_X):
+                                if self.world.block_at(x, y, z) != AIR:
+                                    self.hazard_surface_faces[(axis, sign, y, z)] = x
+                                    break
+            elif axis == 1:
+                for x in range(WORLD_X):
+                    for z in range(WORLD_Z):
+                        if sign > 0:
+                            for y in range(WORLD_Y - 1, -1, -1):
+                                if self.world.block_at(x, y, z) != AIR:
+                                    self.hazard_surface_faces[(axis, sign, x, z)] = y + 1
+                                    break
+                        else:
+                            for y in range(WORLD_Y):
+                                if self.world.block_at(x, y, z) != AIR:
+                                    self.hazard_surface_faces[(axis, sign, x, z)] = y
+                                    break
+            else:
+                for x in range(WORLD_X):
+                    for y in range(WORLD_Y):
+                        if sign > 0:
+                            for z in range(WORLD_Z - 1, -1, -1):
+                                if self.world.block_at(x, y, z) != AIR:
+                                    self.hazard_surface_faces[(axis, sign, x, y)] = z + 1
+                                    break
+                        else:
+                            for z in range(WORLD_Z):
+                                if self.world.block_at(x, y, z) != AIR:
+                                    self.hazard_surface_faces[(axis, sign, x, y)] = z
+                                    break
 
     def mark_chunk_dirty(self, key: ChunkKey) -> None:
         cx, cz = key
@@ -869,99 +930,6 @@ class Game:
             "support": support,
         }
 
-    def populate_xray_mines(self) -> None:
-        if not self.hazard_faces:
-            return
-        for axis, sign in self.hazard_faces:
-            placed = 0
-            tries = 0
-            max_tries = XRAY_MINE_COUNT_PER_FACE * 48
-            while placed < XRAY_MINE_COUNT_PER_FACE and tries < max_tries:
-                tries += 1
-                support = self.random_face_support(axis, sign)
-                if support is None:
-                    continue
-                mine_pos = (
-                    support[0] + (sign if axis == 0 else 0),
-                    support[1] + (sign if axis == 1 else 0),
-                    support[2] + (sign if axis == 2 else 0),
-                )
-                if not self.world.in_bounds(*mine_pos):
-                    continue
-                if self.world.block_at(*mine_pos) != AIR or mine_pos in self.mines:
-                    continue
-                if any(self.player_intersects(i, *mine_pos) for i in range(len(self.players))):
-                    continue
-
-                n = (sign if axis == 0 else 0, sign if axis == 1 else 0, sign if axis == 2 else 0)
-                ref = (0.0, 1.0, 0.0) if abs(n[1]) < 0.9 else (1.0, 0.0, 0.0)
-                tangent_u = v_norm(v_cross(ref, (float(n[0]), float(n[1]), float(n[2]))))
-                tangent_v = v_norm(v_cross((float(n[0]), float(n[1]), float(n[2])), tangent_u))
-                up_i = self.snap_axis_dir((float(n[0]), float(n[1]), float(n[2])))
-                right_i = self.snap_axis_dir(tangent_u, (up_i,))
-                fwd_i = self.snap_axis_dir(tangent_v, (up_i, right_i))
-
-                self.mines[mine_pos] = {
-                    "kind": "xray",
-                    "owner": -1,
-                    "pos": mine_pos,
-                    "normal": n,
-                    "support": support,
-                    "up": up_i,
-                    "right": right_i,
-                    "forward": fwd_i,
-                }
-                placed += 1
-
-    def trigger_xray_mine(self, mine: Dict[str, object], source_player_idx: int) -> None:
-        pos = mine.get("pos")
-        if not isinstance(pos, tuple):
-            return
-        if pos not in self.mines:
-            return
-        self.mines.pop(pos, None)
-
-        up = mine.get("up")
-        right = mine.get("right")
-        fwd = mine.get("forward")
-        if not isinstance(up, tuple) or not isinstance(right, tuple) or not isinstance(fwd, tuple):
-            return
-
-        origin = (pos[0] + 0.5, pos[1] + 0.5, pos[2] + 0.5)
-        dirs = [
-            right,
-            (-right[0], -right[1], -right[2]),
-            fwd,
-            (-fwd[0], -fwd[1], -fwd[2]),
-            (-up[0], -up[1], -up[2]),
-        ]
-        hit_players: Set[int] = set()
-        segments: List[Tuple[Vec3f, Vec3f]] = []
-        for d in dirs:
-            end = origin
-            for i in range(1, XRAY_RAY_RANGE + 1):
-                cell = (pos[0] + d[0] * i, pos[1] + d[1] * i, pos[2] + d[2] * i)
-                if not self.world.in_bounds(*cell):
-                    break
-                end = (cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5)
-                for pidx in range(len(self.players)):
-                    if not self.player_alive(pidx):
-                        continue
-                    if self.player_intersects(pidx, *cell) or self.player_in_blast_cell(pidx, *cell):
-                        hit_players.add(pidx)
-            segments.append((origin, end))
-
-        for pidx in hit_players:
-            self.kill_player(pidx)
-        self.xray_beams.append(
-            {
-                "segments": segments,
-                "life": XRAY_BEAM_DURATION,
-                "ttl": XRAY_BEAM_DURATION,
-                "owner": source_player_idx,
-            }
-        )
-
     def mine_anchor_cell(self, mine: Dict[str, object]) -> Optional[Vec3i]:
         support = mine.get("support")
         if not isinstance(support, tuple):
@@ -980,8 +948,6 @@ class Game:
             return
 
         if pos not in self.mines:
-            return
-        if str(mine.get("kind", "timed")) == "xray":
             return
         self.mines.pop(pos, None)
 
@@ -1138,24 +1104,10 @@ class Game:
                 if isinstance(pos, tuple):
                     unsupported.append(pos)
                 continue
-            kind = str(mine.get("kind", "timed"))
-            if kind == "xray":
-                pos = mine.get("pos")
-                if not isinstance(pos, tuple):
-                    continue
-                center = (pos[0] + 0.5, pos[1] + 0.5, pos[2] + 0.5)
-                for i, p in enumerate(self.players):
-                    if not self.player_alive(i):
-                        continue
-                    d2 = (p.x - center[0]) ** 2 + (p.y - center[1]) ** 2 + (p.z - center[2]) ** 2
-                    if d2 <= XRAY_TRIGGER_RANGE * XRAY_TRIGGER_RANGE:
-                        self.trigger_xray_mine(mine, i)
-                        break
-            else:
-                t = float(mine["timer"]) - dt
-                mine["timer"] = t
-                if t <= 0.0:
-                    to_detonate.append(mine)
+            t = float(mine["timer"]) - dt
+            mine["timer"] = t
+            if t <= 0.0:
+                to_detonate.append(mine)
 
         for pos in unsupported:
             self.mines.pop(pos, None)
@@ -1471,8 +1423,26 @@ class Game:
         glEnable(GL_LIGHTING)
 
     def stabilize_view_direction(self, player_idx: int, look: Vec3f) -> Vec3f:
-        _ = player_idx
-        return v_norm(look)
+        look_n = v_norm(look)
+        pos = self.player_pos(player_idx)
+        up = self.player_up(player_idx, pos)
+        dot_up = v_dot(look_n, up)
+        if abs(dot_up) <= LOOK_POLE_LIMIT:
+            return look_n
+
+        # Keep near-pole looking stable by preserving current heading (azimuth)
+        # while clamping away from the exact singularity.
+        cur = self.look_dir(player_idx)
+        tangent = v_sub(cur, v_scale(up, v_dot(cur, up)))
+        if v_len(tangent) < 1e-5:
+            seed = (1.0, 0.0, 0.0) if abs(up[0]) < 0.9 else (0.0, 0.0, 1.0)
+            tangent = v_norm(v_cross(seed, up))
+        else:
+            tangent = v_norm(tangent)
+
+        clamped_dot = math.copysign(LOOK_POLE_LIMIT, dot_up)
+        tangent_mag = math.sqrt(max(0.0, 1.0 - clamped_dot * clamped_dot))
+        return v_norm(v_add(v_scale(up, clamped_dot), v_scale(tangent, tangent_mag)))
 
     def place_block(self, player_idx: int) -> None:
         if not self.player_alive(player_idx):
@@ -1857,13 +1827,6 @@ class Game:
 
         self.explosion_particles = [p for p in self.explosion_particles if p["life"] > 0.0]
 
-    def update_xray_beams(self, dt: float) -> None:
-        if not self.xray_beams:
-            return
-        for beam in self.xray_beams:
-            beam["life"] = float(beam.get("life", 0.0)) - dt
-        self.xray_beams = [b for b in self.xray_beams if float(b.get("life", 0.0)) > 0.0]
-
     def update_mining(self, player_idx: int, dt: float, is_mining: bool) -> None:
         p = self.players[player_idx]
         if not self.player_alive(player_idx):
@@ -2083,46 +2046,8 @@ class Game:
         glDisableClientState(GL_VERTEX_ARRAY)
 
         self.render_mines(player_idx)
-        self.render_xray_beams()
         self.render_break_particles(player_idx)
         self.render_explosion_particles(player_idx)
-
-    def render_xray_beams(self) -> None:
-        if not self.xray_beams:
-            return
-        was_blend = glIsEnabled(GL_BLEND)
-        glDisable(GL_TEXTURE_2D)
-        glDisable(GL_LIGHTING)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
-        glLineWidth(5.0)
-        glBegin(GL_LINES)
-        for beam in self.xray_beams:
-            life = float(beam.get("life", 0.0))
-            ttl = max(1e-5, float(beam.get("ttl", XRAY_BEAM_DURATION)))
-            a = clamp(life / ttl, 0.0, 1.0)
-            segs = beam.get("segments")
-            if not isinstance(segs, list):
-                continue
-            for seg in segs:
-                if not isinstance(seg, tuple) or len(seg) != 2:
-                    continue
-                p0, p1 = seg
-                if not isinstance(p0, tuple) or not isinstance(p1, tuple):
-                    continue
-                glColor4f(0.62, 1.0, 0.22, 0.22 * a)
-                glVertex3f(p0[0], p0[1], p0[2])
-                glVertex3f(p1[0], p1[1], p1[2])
-                glColor4f(0.94, 1.0, 0.40, 0.85 * a)
-                glVertex3f(p0[0], p0[1], p0[2])
-                glVertex3f(p1[0], p1[1], p1[2])
-        glEnd()
-        glLineWidth(1.0)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        if not was_blend:
-            glDisable(GL_BLEND)
-        glEnable(GL_LIGHTING)
-        glEnable(GL_TEXTURE_2D)
 
     def render_mines(self, player_idx: int) -> None:
         if not self.mines:
@@ -2166,16 +2091,12 @@ class Game:
 
         # Opaque mine bodies.
         for mine, center, n, u, v, _ in visible:
-            kind = str(mine.get("kind", "timed"))
             timer = float(mine.get("timer", 0.0))
 
             r = 0.22
 
             # Closed low-poly sphere body (round mine, fully opaque).
-            if kind == "xray":
-                glColor3f(0.10, 0.12, 0.03)
-            else:
-                glColor3f(0.015, 0.012, 0.01)
+            glColor3f(0.015, 0.012, 0.01)
             for i in range(MINE_SPHERE_STACKS):
                 t0 = math.pi * i / MINE_SPHERE_STACKS
                 t1 = math.pi * (i + 1) / MINE_SPHERE_STACKS
@@ -2194,19 +2115,11 @@ class Game:
                 glEnd()
 
             # Flashing indicator on top.
-            if kind == "xray":
-                elapsed = pygame.time.get_ticks() * 0.001
-                flash = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(elapsed * 8.5))
-            else:
-                elapsed = MINE_FUSE_SECONDS - timer
-                flash = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(elapsed * 11.0))
+            elapsed = MINE_FUSE_SECONDS - timer
+            flash = 0.25 + 0.75 * (0.5 + 0.5 * math.sin(elapsed * 11.0))
             glDisable(GL_LIGHTING)
-            if kind == "xray":
-                glColor4f(0.80 * flash, 1.0 * flash, 0.16 * flash, 1.0)
-                led_r = 0.10
-            else:
-                glColor4f(0.82 * flash, 0.07 * flash, 0.03 * flash, 1.0)
-                led_r = 0.08
+            glColor4f(0.82 * flash, 0.07 * flash, 0.03 * flash, 1.0)
+            led_r = 0.08
             led_center = v_add(center, v_scale(n, r + 0.004))
             glBegin(GL_TRIANGLE_FAN)
             glVertex3f(led_center[0], led_center[1], led_center[2])
@@ -3038,7 +2951,6 @@ class Game:
             self.update_mines(dt)
             self.update_break_feedback(dt)
             self.update_explosion_effects(dt)
-            self.update_xray_beams(dt)
             self.update_respawns(dt)
             self.update_health_feedback(dt)
             self.update_dirty_meshes(per_frame=5)
