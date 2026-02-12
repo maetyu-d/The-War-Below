@@ -40,6 +40,9 @@ MINE_RENDER_DISTANCE = 42.0
 MINE_SPHERE_STACKS = 4
 MINE_SPHERE_SLICES = 8
 PROX_MINE_TRIGGER_RANGE = 2.0
+MINE_THROW_SPEED = 8.0
+MINE_THROW_UP_BIAS = 1.0
+MINE_THROW_COOLDOWN = 1.0
 MINE_TIME_DIRT = 0.48
 MINE_TIME_STONE = 0.95
 MINE_TIME_WOOD = 0.72
@@ -478,6 +481,8 @@ class Game:
         self.dirty_chunks: Set[ChunkKey] = set()
         self.build_all_chunk_meshes()
         self.mines: Dict[Vec3i, Dict[str, object]] = {}
+        self.thrown_mines: List[Dict[str, float]] = []
+        self.next_mine_throw_time: List[float] = [0.0, 0.0]
         self.populate_proximity_mines()
 
         self.selected_block = DIRT
@@ -905,40 +910,70 @@ class Game:
     def place_mine(self, player_idx: int) -> None:
         if not self.player_alive(player_idx):
             return
+        now = pygame.time.get_ticks() * 0.001
+        if now < self.next_mine_throw_time[player_idx]:
+            return
         pos = self.player_pos(player_idx)
         fwd, right, up = self.camera_basis(player_idx, pos)
         up_i = self.snap_axis_dir(up)
         right_i = self.snap_axis_dir(right, (up_i,))
         fwd_i = self.snap_axis_dir(fwd, (up_i, right_i))
+        eye = self.eye_pos(player_idx)
+        launch_pos = v_add(eye, v_add(v_scale(fwd, 0.75), v_scale(up, -0.08)))
+        launch_vel = v_add(v_scale(fwd, MINE_THROW_SPEED), v_scale(up, MINE_THROW_UP_BIAS))
+        self.thrown_mines.append(
+            {
+                "x": launch_pos[0],
+                "y": launch_pos[1],
+                "z": launch_pos[2],
+                "vx": launch_vel[0],
+                "vy": launch_vel[1],
+                "vz": launch_vel[2],
+                "owner": float(player_idx),
+                "upx": float(up_i[0]),
+                "upy": float(up_i[1]),
+                "upz": float(up_i[2]),
+                "rightx": float(right_i[0]),
+                "righty": float(right_i[1]),
+                "rightz": float(right_i[2]),
+                "fwdx": float(fwd_i[0]),
+                "fwdy": float(fwd_i[1]),
+                "fwdz": float(fwd_i[2]),
+                "age": 0.0,
+            }
+        )
+        self.next_mine_throw_time[player_idx] = now + MINE_THROW_COOLDOWN
 
-        base = (math.floor(pos[0]), math.floor(pos[1]), math.floor(pos[2]))
-        key = (base[0] + fwd_i[0], base[1] + fwd_i[1], base[2] + fwd_i[2])
-        if not self.world.in_bounds(*key):
-            return
-        if self.player_intersects(player_idx, *key):
-            return
+    def arm_thrown_mine(self, thrown: Dict[str, float], key: Vec3i, support: Vec3i, normal: Vec3i) -> bool:
+        if not self.world.in_bounds(*key) or not self.world.in_bounds(*support):
+            return False
+        if self.world.block_at(*key) != AIR or self.world.block_at(*support) == AIR:
+            return False
         if key in self.mines:
-            return
+            return False
+        owner = int(thrown.get("owner", -1))
+        if 0 <= owner < len(self.players) and self.player_intersects(owner, *key):
+            return False
 
-        target_block = self.world.block_at(*key)
-        normal = up_i
-        support: Vec3i
-        if target_block != AIR:
-            # One forward is a wall; attach to the wall face toward the player.
-            normal = (-fwd_i[0], -fwd_i[1], -fwd_i[2])
-            support = key
-        else:
-            # In air: prefer sitting on ground below local up.
-            below = (key[0] - up_i[0], key[1] - up_i[1], key[2] - up_i[2])
-            if self.world.in_bounds(*below) and self.world.block_at(*below) != AIR:
-                normal = up_i
-                support = below
-            else:
-                return
+        up_i = (
+            int(round(thrown.get("upx", 0.0))),
+            int(round(thrown.get("upy", 1.0))),
+            int(round(thrown.get("upz", 0.0))),
+        )
+        right_i = (
+            int(round(thrown.get("rightx", 1.0))),
+            int(round(thrown.get("righty", 0.0))),
+            int(round(thrown.get("rightz", 0.0))),
+        )
+        fwd_i = (
+            int(round(thrown.get("fwdx", 0.0))),
+            int(round(thrown.get("fwdy", 0.0))),
+            int(round(thrown.get("fwdz", 1.0))),
+        )
 
         self.mines[key] = {
             "kind": "timed",
-            "owner": player_idx,
+            "owner": owner,
             "pos": key,
             "timer": MINE_FUSE_SECONDS,
             "up": up_i,
@@ -947,6 +982,7 @@ class Game:
             "normal": normal,
             "support": support,
         }
+        return True
 
     def populate_proximity_mines(self) -> None:
         if not self.hazard_faces:
@@ -1190,6 +1226,73 @@ class Game:
                 p.health_hit_flash = max(0.0, p.health_hit_flash - dt * 1.5)
 
     def update_mines(self, dt: float) -> None:
+        if self.thrown_mines:
+            still_flying: List[Dict[str, float]] = []
+            for mine in self.thrown_mines:
+                mine["age"] = float(mine.get("age", 0.0)) + dt
+                prev = (mine["x"], mine["y"], mine["z"])
+                gdir = self.gravity_dir(prev)
+                mine["vx"] += gdir[0] * GRAVITY * dt
+                mine["vy"] += gdir[1] * GRAVITY * dt
+                mine["vz"] += gdir[2] * GRAVITY * dt
+                cur = (
+                    prev[0] + mine["vx"] * dt,
+                    prev[1] + mine["vy"] * dt,
+                    prev[2] + mine["vz"] * dt,
+                )
+                cur_cell = (math.floor(cur[0]), math.floor(cur[1]), math.floor(cur[2]))
+                prev_cell = (math.floor(prev[0]), math.floor(prev[1]), math.floor(prev[2]))
+
+                if not self.world.in_bounds(*cur_cell):
+                    continue
+
+                hit_block = self.world.block_at(*cur_cell) != AIR
+                if hit_block:
+                    if prev_cell != cur_cell and self.world.in_bounds(*prev_cell):
+                        diff = (prev_cell[0] - cur_cell[0], prev_cell[1] - cur_cell[1], prev_cell[2] - cur_cell[2])
+                        if abs(diff[0]) + abs(diff[1]) + abs(diff[2]) != 1:
+                            normal = self.snap_axis_dir((prev[0] - cur[0], prev[1] - cur[1], prev[2] - cur[2]))
+                        else:
+                            normal = diff
+                        if self.arm_thrown_mine(mine, prev_cell, cur_cell, normal):
+                            continue
+
+                    n = self.snap_axis_dir((prev[0] - cur[0], prev[1] - cur[1], prev[2] - cur[2]))
+                    fallback_key = (cur_cell[0] + n[0], cur_cell[1] + n[1], cur_cell[2] + n[2])
+                    if self.arm_thrown_mine(mine, fallback_key, cur_cell, n):
+                        continue
+                    continue
+
+                # If moving through air but adjacent to any solid surface, allow
+                # mine to settle onto that surface after a brief travel window.
+                if mine["age"] > 0.08:
+                    dirs = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+                    settle_normals: List[Vec3i] = []
+                    for d in dirs:
+                        support = (cur_cell[0] - d[0], cur_cell[1] - d[1], cur_cell[2] - d[2])
+                        if not self.world.in_bounds(*support):
+                            continue
+                        if self.world.block_at(*support) != AIR:
+                            settle_normals.append(d)
+                    if settle_normals:
+                        # Prefer surface opposite gravity so floor landings feel natural.
+                        down = self.gravity_dir(cur)
+                        down_i = self.snap_axis_dir(down)
+                        best = settle_normals[0]
+                        best_score = -999.0
+                        for n in settle_normals:
+                            score = n[0] * (-down_i[0]) + n[1] * (-down_i[1]) + n[2] * (-down_i[2])
+                            if score > best_score:
+                                best_score = score
+                                best = n
+                        support = (cur_cell[0] - best[0], cur_cell[1] - best[1], cur_cell[2] - best[2])
+                        if self.arm_thrown_mine(mine, cur_cell, support, best):
+                            continue
+
+                mine["x"], mine["y"], mine["z"] = cur
+                still_flying.append(mine)
+            self.thrown_mines = still_flying
+
         if not self.mines:
             return
         unsupported: List[Vec3i] = []
@@ -2154,8 +2257,72 @@ class Game:
         glDisableClientState(GL_VERTEX_ARRAY)
 
         self.render_mines(player_idx)
+        self.render_thrown_mines(player_idx)
         self.render_break_particles(player_idx)
         self.render_explosion_particles(player_idx)
+
+    def render_thrown_mines(self, player_idx: int) -> None:
+        if not self.thrown_mines:
+            return
+        cam = self.player_pos(player_idx)
+        max_r2 = MINE_RENDER_DISTANCE * MINE_RENDER_DISTANCE
+        was_blend = glIsEnabled(GL_BLEND)
+        glDisable(GL_TEXTURE_2D)
+        glDisable(GL_CULL_FACE)
+        glEnable(GL_LIGHTING)
+
+        for mine in self.thrown_mines:
+            center = (mine["x"], mine["y"], mine["z"])
+            d2 = (center[0] - cam[0]) ** 2 + (center[1] - cam[1]) ** 2 + (center[2] - cam[2]) ** 2
+            if d2 > max_r2:
+                continue
+            n = v_norm(v_scale(self.gravity_dir(center), -1.0))
+            ref = (0.0, 1.0, 0.0) if abs(n[1]) < 0.9 else (1.0, 0.0, 0.0)
+            u = v_norm(v_cross(ref, n))
+            v = v_norm(v_cross(n, u))
+            r = 0.18
+            glColor3f(0.02, 0.02, 0.02)
+            for i in range(MINE_SPHERE_STACKS):
+                t0 = math.pi * i / MINE_SPHERE_STACKS
+                t1 = math.pi * (i + 1) / MINE_SPHERE_STACKS
+                glBegin(GL_TRIANGLE_STRIP)
+                for j in range(MINE_SPHERE_SLICES + 1):
+                    p = 2.0 * math.pi * j / MINE_SPHERE_SLICES
+                    for t in (t0, t1):
+                        st = math.sin(t)
+                        ct = math.cos(t)
+                        cp = math.cos(p)
+                        sp = math.sin(p)
+                        normal_vec = v_norm(v_add(v_scale(n, ct), v_add(v_scale(u, st * cp), v_scale(v, st * sp))))
+                        point = v_add(center, v_scale(normal_vec, r))
+                        glNormal3f(normal_vec[0], normal_vec[1], normal_vec[2])
+                        glVertex3f(point[0], point[1], point[2])
+                glEnd()
+
+            pulse = 0.45 + 0.55 * (0.5 + 0.5 * math.sin(pygame.time.get_ticks() * 0.015))
+            glDisable(GL_LIGHTING)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+            glColor4f(1.0 * pulse, 0.42 * pulse, 0.08 * pulse, 0.65)
+            glow_center = v_add(center, v_scale(n, r + 0.005))
+            glBegin(GL_TRIANGLE_FAN)
+            glVertex3f(glow_center[0], glow_center[1], glow_center[2])
+            for i in range(15):
+                a = (math.pi * 2.0 * i) / 14.0
+                c = math.cos(a)
+                s = math.sin(a)
+                edge = v_add(glow_center, v_add(v_scale(u, c * 0.12), v_scale(v, s * 0.12)))
+                glVertex3f(edge[0], edge[1], edge[2])
+            glEnd()
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            if not was_blend:
+                glDisable(GL_BLEND)
+            glEnable(GL_LIGHTING)
+
+        glEnable(GL_CULL_FACE)
+        if was_blend:
+            glEnable(GL_BLEND)
+        glEnable(GL_TEXTURE_2D)
 
     def render_mines(self, player_idx: int) -> None:
         if not self.mines:
