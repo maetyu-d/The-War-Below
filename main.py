@@ -1658,13 +1658,9 @@ class Game:
         return v_norm(v_add(v_scale(up, clamped_dot), v_scale(tangent, tangent_mag)))
 
     def place_block(self, player_idx: int) -> None:
-        if not self.player_alive(player_idx):
-            return
-        _, prev = self.raycast_block(REACH, player_idx)
-        if prev:
-            px, py, pz = prev
-            if self.world.block_at(px, py, pz) == AIR and not self.player_intersects(player_idx, px, py, pz):
-                self.set_world_block(px, py, pz, self.selected_block)
+        # Building is disabled: tunnel-only gameplay.
+        _ = player_idx
+        return
 
     def process_input(self, dt: float) -> None:
         for event in pygame.event.get():
@@ -3196,15 +3192,15 @@ class Game:
         self.draw_screen_text(left_x, top_y, "Controls (Press C to close)", (255, 242, 120, 255), small=False)
         self.draw_screen_text(left_x, top_y + 36.0, "Player 1 - Keyboard/Mouse only", (255, 255, 170, 255), small=True)
         self.draw_screen_text(left_x, top_y + 58.0, "W/A/S/D move    Mouse look    Space jump", (235, 230, 210, 255))
-        self.draw_screen_text(left_x, top_y + 80.0, "LMB hold mine   RMB place block   E place mine", (235, 230, 210, 255))
-        self.draw_screen_text(left_x, top_y + 102.0, "1/2/3 select block   . show player lines", (235, 230, 210, 255))
+        self.draw_screen_text(left_x, top_y + 80.0, "LMB hold mine   E hold/release throw mine", (235, 230, 210, 255))
+        self.draw_screen_text(left_x, top_y + 102.0, ". show player lines", (235, 230, 210, 255))
         self.draw_screen_text(left_x, top_y + 136.0, "Player 1 does not use gamepad", (220, 225, 205, 255))
         self.draw_screen_text(left_x, top_y + 158.0, "Use USB gamepad for Player 2 only", (220, 225, 205, 255))
 
         self.draw_screen_text(right_x, top_y + 36.0, "Player 2 - Gamepad required", (255, 255, 170, 255), small=True)
         self.draw_screen_text(right_x, top_y + 58.0, "LS move    RS look    A jump", (235, 230, 210, 255))
-        self.draw_screen_text(right_x, top_y + 80.0, "RB mine    X place block    Y place mine", (235, 230, 210, 255))
-        self.draw_screen_text(right_x, top_y + 102.0, "B/LB cycle block", (235, 230, 210, 255))
+        self.draw_screen_text(right_x, top_y + 80.0, "RB mine    Y hold/release throw mine", (235, 230, 210, 255))
+        self.draw_screen_text(right_x, top_y + 102.0, "Tunneling only (building disabled)", (235, 230, 210, 255))
 
         self.draw_screen_text(right_x, top_y + 136.0, "Shared", (255, 255, 170, 255), small=True)
         self.draw_screen_text(right_x, top_y + 158.0, "Esc quit   C toggle this help", (235, 230, 210, 255))
