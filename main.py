@@ -527,61 +527,36 @@ class Game:
         self.apply_pad_assignments()
 
     def auto_assign_gamepads(self) -> None:
-        if len(self.gamepads) >= 2:
-            self.p1_pad_slot = 0
-            self.p2_pad_slot = 1
-        elif len(self.gamepads) == 1:
-            self.p1_pad_slot = None
-            self.p2_pad_slot = 0
-        else:
-            self.p1_pad_slot = None
-            self.p2_pad_slot = None
+        self.p1_pad_slot = None
+        self.p2_pad_slot = 0 if len(self.gamepads) >= 1 else None
 
     def ensure_valid_pad_assignments(self) -> None:
+        self.p1_pad_slot = None
         if len(self.gamepads) == 0:
-            self.p1_pad_slot = None
             self.p2_pad_slot = None
             return
 
-        if self.p1_pad_slot is not None and self.p1_pad_slot >= len(self.gamepads):
-            self.p1_pad_slot = None
         if self.p2_pad_slot is not None and self.p2_pad_slot >= len(self.gamepads):
             self.p2_pad_slot = None
 
-        if self.p1_pad_slot is not None and self.p2_pad_slot is not None and self.p1_pad_slot == self.p2_pad_slot:
-            for i in range(len(self.gamepads)):
-                if i != self.p1_pad_slot:
-                    self.p2_pad_slot = i
-                    break
-            else:
-                self.p2_pad_slot = self.p1_pad_slot
-
         if self.p2_pad_slot is None and len(self.gamepads) > 0:
-            for i in range(len(self.gamepads)):
-                if i != self.p1_pad_slot:
-                    self.p2_pad_slot = i
-                    break
-            else:
-                self.p2_pad_slot = 0
+            self.p2_pad_slot = 0
 
     def apply_pad_assignments(self) -> None:
-        self.p1_pad = self.gamepads[self.p1_pad_slot] if self.p1_pad_slot is not None and self.p1_pad_slot < len(self.gamepads) else None
+        self.p1_pad = None
         self.p2_pad = self.gamepads[self.p2_pad_slot] if self.p2_pad_slot is not None and self.p2_pad_slot < len(self.gamepads) else None
 
     def cycle_pad_slot(self, player_idx: int, step: int) -> None:
+        if player_idx == 0:
+            return
         slots: List[Optional[int]]
         other_slot: Optional[int]
         current: Optional[int]
-        if player_idx == 0:
-            other_slot = self.p2_pad_slot
-            current = self.p1_pad_slot
-            slots = [None] + [i for i in range(len(self.gamepads)) if i != other_slot]
-        else:
-            other_slot = self.p1_pad_slot
-            current = self.p2_pad_slot
-            slots = [i for i in range(len(self.gamepads)) if i != other_slot]
-            if not slots:
-                slots = [None]
+        other_slot = self.p1_pad_slot
+        current = self.p2_pad_slot
+        slots = [i for i in range(len(self.gamepads)) if i != other_slot]
+        if not slots:
+            slots = [None]
 
         if not slots:
             return
@@ -589,12 +564,9 @@ class Game:
             current = slots[0]
         idx = slots.index(current)
         nxt = slots[(idx + step) % len(slots)]
-        if player_idx == 0:
-            self.p1_pad_slot = nxt
-        else:
-            self.p2_pad_slot = nxt
-            if self.p2_pad_slot is None and len(self.gamepads) > 0:
-                self.p2_pad_slot = 0
+        self.p2_pad_slot = nxt
+        if self.p2_pad_slot is None and len(self.gamepads) > 0:
+            self.p2_pad_slot = 0
         self.ensure_valid_pad_assignments()
         self.apply_pad_assignments()
 
@@ -1711,8 +1683,6 @@ class Game:
                     self.selected_block = WOOD
                 elif event.key == pygame.K_c:
                     self.show_controls_help = not self.show_controls_help
-                elif self.show_controls_help and event.key == pygame.K_F1:
-                    self.cycle_pad_slot(0, 1)
                 elif self.show_controls_help and event.key == pygame.K_F2:
                     self.cycle_pad_slot(1, 1)
                 elif self.show_controls_help and event.key == pygame.K_F3:
@@ -1739,27 +1709,6 @@ class Game:
         p2_jump = False
         p2_mine_hold = False
         p2_throw_hold = False
-
-        # Optional gamepad controls for Player 1 (keyboard/mouse still work).
-        if self.p1_pad is not None:
-            gp_mx = self.read_axis(self.p1_pad, 0)
-            gp_mz = -self.read_axis(self.p1_pad, 1)
-            p1_move_x = clamp(p1_move_x + gp_mx, -1.0, 1.0)
-            p1_move_z = clamp(p1_move_z + gp_mz, -1.0, 1.0)
-            p1_jump = p1_jump or self.read_button(self.p1_pad, 0)
-            p1_mine_hold = p1_mine_hold or self.read_button(self.p1_pad, 5)
-            p1_throw_hold = p1_throw_hold or self.read_button(self.p1_pad, 3)
-
-            lx = self.read_axis(self.p1_pad, 2)
-            ly = self.read_axis(self.p1_pad, 3)
-            self.handle_gamepad_look(0, lx, ly, dt)
-
-            if self.edge_button(0, 2, self.read_button(self.p1_pad, 2)):
-                self.place_block(0)
-            if self.edge_button(0, 1, self.read_button(self.p1_pad, 1)):
-                self.selected_block = DIRT if self.selected_block == WOOD else self.selected_block + 1
-            if self.edge_button(0, 4, self.read_button(self.p1_pad, 4)):
-                self.selected_block = WOOD if self.selected_block == DIRT else self.selected_block - 1
 
         # Player 2 must use gamepad.
         if self.p2_pad is not None:
@@ -3245,12 +3194,12 @@ class Game:
         top_y = pad + 14.0
 
         self.draw_screen_text(left_x, top_y, "Controls (Press C to close)", (255, 242, 120, 255), small=False)
-        self.draw_screen_text(left_x, top_y + 36.0, "Player 1 - Keyboard/Mouse (+optional gamepad)", (255, 255, 170, 255), small=True)
+        self.draw_screen_text(left_x, top_y + 36.0, "Player 1 - Keyboard/Mouse only", (255, 255, 170, 255), small=True)
         self.draw_screen_text(left_x, top_y + 58.0, "W/A/S/D move    Mouse look    Space jump", (235, 230, 210, 255))
         self.draw_screen_text(left_x, top_y + 80.0, "LMB hold mine   RMB place block   E place mine", (235, 230, 210, 255))
         self.draw_screen_text(left_x, top_y + 102.0, "1/2/3 select block   . show player lines", (235, 230, 210, 255))
-        self.draw_screen_text(left_x, top_y + 136.0, "P1 Gamepad: LS move, RS look, A jump", (220, 225, 205, 255))
-        self.draw_screen_text(left_x, top_y + 158.0, "RB mine, X place block, Y place mine, B/LB cycle block", (220, 225, 205, 255))
+        self.draw_screen_text(left_x, top_y + 136.0, "Player 1 does not use gamepad", (220, 225, 205, 255))
+        self.draw_screen_text(left_x, top_y + 158.0, "Use USB gamepad for Player 2 only", (220, 225, 205, 255))
 
         self.draw_screen_text(right_x, top_y + 36.0, "Player 2 - Gamepad required", (255, 255, 170, 255), small=True)
         self.draw_screen_text(right_x, top_y + 58.0, "LS move    RS look    A jump", (235, 230, 210, 255))
@@ -3262,18 +3211,16 @@ class Game:
 
         status_y = top_y + 206.0
         self.draw_screen_text(left_x, status_y, "USB Gamepad Setup", (255, 232, 130, 255), small=True)
-        self.draw_screen_text(left_x, status_y + 22.0, "F1 cycle P1 pad    F2 cycle P2 pad", (225, 220, 205, 255))
-        self.draw_screen_text(left_x, status_y + 44.0, "F3 auto-assign pads    F5 rescan USB pads", (225, 220, 205, 255))
+        self.draw_screen_text(left_x, status_y + 22.0, "F2 cycle P2 pad", (225, 220, 205, 255))
+        self.draw_screen_text(left_x, status_y + 44.0, "F3 auto-assign P2 pad    F5 rescan USB pads", (225, 220, 205, 255))
 
-        p1_name = "None"
+        p1_name = "Keyboard/Mouse"
         p2_name = "None"
-        if self.p1_pad is not None:
-            p1_name = f"#{self.p1_pad_slot} {self.p1_pad.get_name()}"
         if self.p2_pad is not None:
             p2_name = f"#{self.p2_pad_slot} {self.p2_pad.get_name()}"
         self.draw_screen_text(left_x, status_y + 72.0, f"P1 assigned: {p1_name}", (255, 246, 170, 255))
         self.draw_screen_text(left_x, status_y + 94.0, f"P2 assigned: {p2_name}", (255, 246, 170, 255))
-        self.draw_screen_text(left_x, status_y + 124.0, f"P1 live: {self.gamepad_live_status(self.p1_pad)}", (242, 238, 208, 255))
+        self.draw_screen_text(left_x, status_y + 124.0, "P1 live: keyboard/mouse", (242, 238, 208, 255))
         self.draw_screen_text(left_x, status_y + 146.0, f"P2 live: {self.gamepad_live_status(self.p2_pad)}", (242, 238, 208, 255))
 
         detected = len(self.gamepads)
@@ -3283,8 +3230,6 @@ class Game:
         for i in range(max_list):
             pad = self.gamepads[i]
             flags: List[str] = []
-            if self.p1_pad_slot == i:
-                flags.append("P1")
             if self.p2_pad_slot == i:
                 flags.append("P2")
             label = ",".join(flags) if flags else "free"
