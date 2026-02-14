@@ -1,5 +1,7 @@
 # The War Below
 
+!()[https://github.com/maetyu-d/The-War-Below/blob/main/Screenshot%202026-02-10%20at%2014.33.52.png?raw=true]
+
 A split-screen, two-player tunneling warfare game built with Python + OpenGL (tested on macOS 13.7.8).
 
 
